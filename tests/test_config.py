@@ -37,7 +37,7 @@ class TestConfig:
         assert config.get("feature.enabled") is False
 
     def test_env_override_true_is_boolean(self, monkeypatch):
-        monkeypatch.setenv("AO_FEATURE_ENABLED", "TRUE")
+        monkeypatch.setenv("AO_FEATURE_ENABLED", " TRUE ")
         config = Config()
         assert config.get("feature.enabled") is True
 
