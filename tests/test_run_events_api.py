@@ -79,6 +79,20 @@ def test_unauthorized_run_events_request_never_touches_store():
     assert store.lookups == 0
 
 
+def test_blank_bearer_token_never_touches_store():
+    store = CountingRunEventStore()
+    client = _client_with_store(store)
+
+    response = client.get(
+        "/api/v2/runs/run-1/events",
+        params={"workspace_id": "workspace-1", "limit": 1},
+        headers={"Authorization": "Bearer "},
+    )
+
+    assert response.status_code == 401
+    assert store.lookups == 0
+
+
 def test_malformed_limit_is_rejected_before_store_lookup():
     store = CountingRunEventStore()
     client = _client_with_store(store)
@@ -86,6 +100,34 @@ def test_malformed_limit_is_rejected_before_store_lookup():
     response = client.get(
         "/api/v2/runs/run-1/events",
         params={"workspace_id": "workspace-1", "limit": "many"},
+        headers={"Authorization": "Bearer test-token"},
+    )
+
+    assert response.status_code == 422
+    assert store.lookups == 0
+
+
+def test_zero_limit_is_rejected_before_store_lookup():
+    store = CountingRunEventStore()
+    client = _client_with_store(store)
+
+    response = client.get(
+        "/api/v2/runs/run-1/events",
+        params={"workspace_id": "workspace-1", "limit": 0},
+        headers={"Authorization": "Bearer test-token"},
+    )
+
+    assert response.status_code == 422
+    assert store.lookups == 0
+
+
+def test_negative_offset_is_rejected_before_store_lookup():
+    store = CountingRunEventStore()
+    client = _client_with_store(store)
+
+    response = client.get(
+        "/api/v2/runs/run-1/events",
+        params={"workspace_id": "workspace-1", "limit": 1, "offset": -1},
         headers={"Authorization": "Bearer test-token"},
     )
 
@@ -108,6 +150,29 @@ def test_limit_above_cap_is_rejected_before_store_lookup():
 
     assert response.status_code == 422
     assert store.lookups == 0
+
+
+def test_exact_pagination_window_boundary_reaches_bounded_lookup():
+    store = CountingRunEventStore()
+    client = _client_with_store(store)
+
+    response = client.get(
+        "/api/v2/runs/run-1/events",
+        params={
+            "workspace_id": "workspace-1",
+            "limit": MAX_RUN_EVENTS_LIMIT,
+            "offset": MAX_RUN_EVENTS_WINDOW - MAX_RUN_EVENTS_LIMIT,
+        },
+        headers={"Authorization": "Bearer test-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["pagination"] == {
+        "limit": MAX_RUN_EVENTS_LIMIT,
+        "offset": MAX_RUN_EVENTS_WINDOW - MAX_RUN_EVENTS_LIMIT,
+        "window": MAX_RUN_EVENTS_WINDOW,
+    }
+    assert store.lookups == 1
 
 
 def test_route_pagination_window_is_rejected_before_store_lookup():
