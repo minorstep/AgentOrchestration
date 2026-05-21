@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,39 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_reclaim_worker_disconnect_requeues_reserved_job_once(self):
+        import asyncio
+        task_id = self.scheduler.enqueue(
+            {"type": "test", "payload": {"private": "value"}},
+            queue="critical",
+            priority=7,
+        )
+
+        task = asyncio.run(
+            self.scheduler.dequeue(queue="critical", worker_id="worker-1")
+        )
+        reservation_id = task["reservation"]["id"]
+
+        assert task["id"] == task_id
+        assert self.scheduler.reclaim_worker_reservations("worker-1") == 1
+        assert self.scheduler.reclaim_worker_reservations("worker-1") == 0
+        assert not self.scheduler.complete(task_id, reservation_id)
+
+        redelivered = asyncio.run(
+            self.scheduler.dequeue(queue="critical", worker_id="worker-2")
+        )
+        assert redelivered["id"] == task_id
+        assert redelivered["retries"] == 0
+        assert redelivered["reclaim_count"] == 1
+        assert redelivered["reservation"]["worker_id"] == "worker-2"
+        assert redelivered["reservation"]["id"] != reservation_id
+
+        events = self.scheduler.audit_events()
+        assert events[-1]["event"] == "complete_rejected"
+        assert events[-2]["event"] == "reservation_reclaimed"
+        assert events[-2]["reason"] == "worker_disconnect"
+        assert "private" not in str(events)
 
 # 2019-01-09T19:07:03 update
 
