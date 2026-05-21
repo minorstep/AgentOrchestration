@@ -3,10 +3,12 @@
 import os
 from typing import Dict
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Request
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
+from .auth import AuthService
 from .routes import router
 from .middleware import AuthMiddleware, RateLimitMiddleware, LoggingMiddleware
 
@@ -16,9 +18,11 @@ def create_app(config: Dict = None) -> FastAPI:
         title="Agent Orchestrator API",
         version="2.4.1",
         description="Enterprise Agent Orchestration Platform API",
-        docs_url="/api/docs",
-        redoc_url="/api/redoc",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
+    app.state.auth_service = AuthService()
 
     app.add_middleware(
         CORSMiddleware,
@@ -28,7 +32,10 @@ def create_app(config: Dict = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","))
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","),
+    )
 
     app.add_middleware(AuthMiddleware)
     app.add_middleware(RateLimitMiddleware)
@@ -39,6 +46,27 @@ def create_app(config: Dict = None) -> FastAPI:
     @app.get("/health")
     async def health():
         return {"status": "healthy", "version": "2.4.1"}
+
+    @app.get("/api/openapi.json")
+    async def protected_openapi(request: Request):
+        app.state.auth_service.require_docs_access(request)
+        return app.openapi()
+
+    @app.get("/api/docs")
+    async def protected_docs(request: Request):
+        app.state.auth_service.require_docs_access(request)
+        return get_swagger_ui_html(
+            openapi_url="/api/openapi.json",
+            title="Agent Orchestrator API docs",
+        )
+
+    @app.get("/api/redoc")
+    async def protected_redoc(request: Request):
+        app.state.auth_service.require_docs_access(request)
+        return get_redoc_html(
+            openapi_url="/api/openapi.json",
+            title="Agent Orchestrator API redoc",
+        )
 
     return app
 
