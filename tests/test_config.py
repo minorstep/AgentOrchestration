@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,26 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_scoped_environment_override(self, monkeypatch):
+        monkeypatch.setenv("AO_CONFIG_APP_NAME", "env-app")
+        monkeypatch.setenv("AO_CONFIG_DATABASE_HOST", "db.local")
+
+        config = Config()
+
+        assert config.get("app.name") == "env-app"
+        assert config.get("database.host") == "db.local"
+
+    def test_runtime_environment_values_are_ignored(self, monkeypatch):
+        monkeypatch.setenv("AO_AGENT_ID", "agent-123")
+        monkeypatch.setenv("AO_API_URL", "https://api.example.test")
+        monkeypatch.setenv("AO_API_KEY", "sdk-key")
+
+        config = Config()
+
+        assert config.get("agent.id") is None
+        assert config.get("api.url") is None
+        assert config.get("api.key") is None
 
 # 2019-02-01T18:58:35 update
 

@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional
 
 
 class Config:
+    ENV_OVERRIDE_PREFIX = "AO_CONFIG_"
+
     def __init__(self, config_path: Optional[str] = None):
         self._data: Dict[str, Any] = {}
         if config_path:
@@ -17,11 +19,18 @@ class Config:
             self._data = json.load(f)
 
     def _load_env_overrides(self) -> None:
-        prefix = "AO_"
         for key, value in os.environ.items():
-            if key.startswith(prefix):
-                config_key = key[len(prefix):].lower().replace("_", ".")
+            config_key = self._env_to_config_key(key)
+            if config_key:
                 self._set_nested(config_key, value)
+
+    def _env_to_config_key(self, key: str) -> Optional[str]:
+        if not key.startswith(self.ENV_OVERRIDE_PREFIX):
+            return None
+        suffix = key[len(self.ENV_OVERRIDE_PREFIX):]
+        if not suffix:
+            return None
+        return suffix.lower().replace("_", ".")
 
     def _set_nested(self, key: str, value: Any) -> None:
         parts = key.split(".")
@@ -34,7 +43,7 @@ class Config:
 
     def get(self, key: str, default: Any = None) -> Any:
         parts = key.split(".")
-        current = self._data
+        current: Any = self._data
         for part in parts:
             if isinstance(current, dict):
                 current = current.get(part)
