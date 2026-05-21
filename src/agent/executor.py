@@ -2,7 +2,7 @@
 
 import asyncio
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Set
 from uuid import uuid4
 
 
@@ -11,25 +11,66 @@ class AgentExecutor:
         self.max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_tasks: Dict[str, asyncio.Task] = {}
+        self._execution_metadata: Dict[str, Dict[str, Any]] = {}
+        self._cancel_requested: Set[str] = set()
         self._results: Dict[str, Any] = {}
 
-    async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
+    async def execute(
+        self,
+        agent_id: str,
+        task: Dict[str, Any],
+        handler: Callable,
+    ) -> str:
         execution_id = str(uuid4())
         async with self._semaphore:
+            started_at = time.time()
+            self._execution_metadata[execution_id] = {
+                "agent_id": agent_id,
+                "task_id": task.get("id"),
+                "started_at": started_at,
+            }
             task_obj = asyncio.create_task(
                 self._run_execution(execution_id, agent_id, task, handler)
             )
             self._active_tasks[execution_id] = task_obj
             try:
-                result = await task_obj
+                result = await asyncio.shield(task_obj)
                 self._results[execution_id] = result
+            except asyncio.CancelledError:
+                cancel_was_requested = execution_id in self._cancel_requested
+                task_obj.cancel()
+                await asyncio.gather(task_obj, return_exceptions=True)
+                self._store_cancelled_result(execution_id)
+                if not cancel_was_requested:
+                    raise
             except Exception as e:
                 self._results[execution_id] = {"error": str(e)}
             finally:
                 self._active_tasks.pop(execution_id, None)
+                self._execution_metadata.pop(execution_id, None)
+                self._cancel_requested.discard(execution_id)
         return execution_id
 
-    async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
+    def _store_cancelled_result(self, execution_id: str) -> None:
+        metadata = self._execution_metadata.get(execution_id, {})
+        started_at = metadata.get("started_at", time.time())
+        self._results[execution_id] = {
+            "execution_id": execution_id,
+            "agent_id": metadata.get("agent_id"),
+            "task_id": metadata.get("task_id"),
+            "status": "cancelled",
+            "cancelled": True,
+            "duration": time.time() - started_at,
+            "timestamp": time.time(),
+        }
+
+    async def _run_execution(
+        self,
+        exec_id: str,
+        agent_id: str,
+        task: Dict,
+        handler: Callable,
+    ) -> Any:
         start = time.time()
         result = await handler(agent_id, task)
         duration = time.time() - start
@@ -48,15 +89,20 @@ class AgentExecutor:
     def cancel(self, execution_id: str) -> bool:
         task = self._active_tasks.get(execution_id)
         if task and not task.done():
+            self._cancel_requested.add(execution_id)
+            self._store_cancelled_result(execution_id)
             task.cancel()
             return True
         return False
 
     async def shutdown(self) -> None:
-        for task in self._active_tasks.values():
-            task.cancel()
+        for execution_id in list(self._active_tasks.keys()):
+            self.cancel(execution_id)
         if self._active_tasks:
-            await asyncio.gather(*self._active_tasks.values(), return_exceptions=True)
+            await asyncio.gather(
+                *self._active_tasks.values(),
+                return_exceptions=True,
+            )
 
 # 2019-01-31T14:19:34 update
 
