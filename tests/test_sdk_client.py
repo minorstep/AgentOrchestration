@@ -1,6 +1,7 @@
 import pytest
 
 from src.common.errors import AuthenticationError
+from src.sdk import AuthenticationError as SDKAuthenticationError
 from src.sdk.client import OrchestratorClient
 
 
@@ -19,6 +20,9 @@ class FakeResponse:
 
 
 class TestOrchestratorClientAuthSetup:
+    def test_authentication_error_is_exported_from_sdk(self):
+        assert SDKAuthenticationError is AuthenticationError
+
     def test_missing_api_key_fails_before_any_request(self, monkeypatch):
         monkeypatch.delenv("AO_API_KEY", raising=False)
 
@@ -65,12 +69,12 @@ class TestOrchestratorClientAuthSetup:
 
         assert "must be a non-empty string" in str(exc_info.value)
 
-    def test_explicit_api_key_is_trimmed_and_preferred_over_env(
+    def test_explicit_api_key_is_trimmed_and_preferred_over_blank_env(
         self,
         monkeypatch,
     ):
         captured = {}
-        monkeypatch.setenv("AO_API_KEY", "env-secret")
+        monkeypatch.setenv("AO_API_KEY", "   ")
 
         def fake_urlopen(req):
             captured["headers"] = dict(req.header_items())
