@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,55 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_dequeue_enforces_per_tenant_concurrency_limit(self):
+        self.scheduler.enqueue({"type": "first", "tenant_id": "acme"})
+        self.scheduler.enqueue({"type": "second", "tenant_id": "acme"})
+        self.scheduler.enqueue({"type": "other", "tenant_id": "globex"})
+
+        import asyncio
+        first = asyncio.run(self.scheduler.dequeue())
+        other = asyncio.run(self.scheduler.dequeue())
+        blocked = asyncio.run(self.scheduler.dequeue())
+
+        assert first["type"] == "first"
+        assert other["type"] == "other"
+        assert blocked is None
+        assert self.scheduler.complete(first["id"])
+
+        second = asyncio.run(self.scheduler.dequeue())
+        assert second["type"] == "second"
+
+    def test_recovery_defers_extra_tenant_tasks_with_sanitized_audit(self):
+        recovered = self.scheduler.recover_in_flight([
+            {
+                "id": "task-1",
+                "type": "recover",
+                "tenant_id": "acme",
+                "payload": {"secret": "hidden"},
+            },
+            {
+                "id": "task-2",
+                "type": "recover",
+                "tenant_id": "acme",
+                "payload": {"secret": "hidden"},
+            },
+        ])
+
+        assert recovered == ["task-1"]
+
+        audit_records = self.scheduler.audit_records
+        assert audit_records[0]["decision"] == "recovered"
+        assert audit_records[1]["decision"] == "deferred"
+        assert audit_records[1]["reason"] == "tenant_concurrency_limit"
+        assert "payload" not in audit_records[1]
+        assert "secret" not in str(audit_records)
+
+        import asyncio
+        assert asyncio.run(self.scheduler.dequeue()) is None
+        assert self.scheduler.complete("task-1")
+        recovered_after_capacity_frees = asyncio.run(self.scheduler.dequeue())
+        assert recovered_after_capacity_frees["id"] == "task-2"
 
 # 2019-01-09T19:07:03 update
 
