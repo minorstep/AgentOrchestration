@@ -1,4 +1,6 @@
-import pytest
+import asyncio
+import logging
+
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +14,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +21,91 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_failed_task_retry_preserves_identity(self):
+        task_id = self.scheduler.enqueue({"type": "test"}, priority=7)
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(task["id"])
+
+        retried = asyncio.run(self.scheduler.dequeue())
+        assert retried["id"] == task_id
+        assert retried["retries"] == 1
+        assert retried["priority"] == 7
+
+    def test_exhausted_task_enters_dead_letter_once(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task["id"] == task_id
+        assert self.scheduler.fail(task_id)
+        assert self.scheduler.get_dead_letter(task_id) is None
+
+        retried = asyncio.run(self.scheduler.dequeue())
+        assert retried["id"] == task_id
+        assert retried["retries"] == 1
+        assert self.scheduler.fail(task_id)
+        assert self.scheduler.get_dead_letter(task_id) is None
+
+        retried = asyncio.run(self.scheduler.dequeue())
+        assert retried["id"] == task_id
+        assert retried["retries"] == 2
+
+        assert self.scheduler.fail(task_id)
+        first_dead_letter = self.scheduler.get_dead_letter(task_id)
+
+        assert first_dead_letter["id"] == task_id
+        assert first_dead_letter["retries"] == 3
+        assert asyncio.run(self.scheduler.dequeue()) is None
+
+        assert self.scheduler.fail(task_id)
+        assert self.scheduler.dead_letters() == {task_id: first_dead_letter}
+        dead_letter_events = [
+            record
+            for record in self.scheduler.audit_records()
+            if record["event"] == "task_dead_lettered"
+        ]
+        assert len(dead_letter_events) == 1
+
+    def test_stale_ack_is_rejected_and_audited(self):
+        assert not self.scheduler.fail("missing-task")
+
+        assert self.scheduler.audit_records()[-1]["event"] == "ack_rejected"
+        assert self.scheduler.dead_letters() == {}
+
+    def test_dead_letter_audit_does_not_expose_payload(self, caplog):
+        caplog.set_level(logging.INFO, logger="src.orchestrator.scheduler")
+        task_id = self.scheduler.enqueue(
+            {
+                "type": "test",
+                "payload": {"token": "secret-runtime-token"},
+            }
+        )
+
+        for _ in range(3):
+            asyncio.run(self.scheduler.dequeue())
+            self.scheduler.fail(task_id)
+
+        log_text = caplog.text
+        assert "secret-runtime-token" not in log_text
+        assert "secret-runtime-token" not in str(
+            self.scheduler.audit_records()
+        )
+        assert "secret-runtime-token" not in str(
+            self.scheduler.get_dead_letter(task_id)
+        )
 
 # 2019-01-09T19:07:03 update
 
