@@ -2,21 +2,66 @@
 
 import time
 import logging
-from typing import Callable
+from typing import Callable, Dict, List
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 logger = logging.getLogger(__name__)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        is_api_request = request.url.path.startswith("/api/v2")
+        is_token_route = request.url.path == "/api/v2/auth/token"
+        if is_api_request and not is_token_route:
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
         return await call_next(request)
+
+
+class ErrorSanitizingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        try:
+            response = await call_next(request)
+            response.headers["X-Error-Sanitized"] = "true"
+            return response
+        except Exception:
+            logger.error(
+                "Unhandled request error",
+                extra={"request": self._safe_request_context(request)},
+            )
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": "internal_server_error",
+                    "message": "Internal server error",
+                },
+                headers={"X-Error-Sanitized": "true"},
+            )
+        finally:
+            request.scope.get("state", {}).clear()
+
+    def _safe_request_context(self, request: Request) -> Dict[str, object]:
+        headers = {
+            key: "[redacted]"
+            for key in request.headers.keys()
+        }
+        return {
+            "method": request.method,
+            "path": request.url.path,
+            "query": "[redacted]" if request.url.query else "",
+            "headers": headers,
+        }
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -24,16 +69,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
         self.max_requests = max_requests
         self.window = window
-        self._requests = {}
+        self._requests: Dict[str, List[float]] = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +94,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            f"{request.method} {request.url.path} "
+            f"{response.status_code} {duration:.3f}s"
+        )
         return response
 
 # 2019-03-01T18:35:19 update
