@@ -1,7 +1,7 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 from uuid import uuid4
 
 
@@ -9,20 +9,33 @@ class StepStatus(Enum):
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
+    COMPENSATED = "compensated"
+    COMPENSATION_FAILED = "compensation_failed"
     FAILED = "failed"
+    BLOCKED = "blocked"
     SKIPPED = "skipped"
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        compensate: Optional[Callable] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
+        self.compensate = compensate
         self.retries = retries
         self.timeout = timeout
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
+        self.compensation_error: Optional[str] = None
+        self.blocked_reason: Optional[str] = None
 
 
 class Workflow:
@@ -32,9 +45,16 @@ class Workflow:
         self.description = description
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
+        self._blocked_step_ids: Set[str] = set()
+        self.audit_records: List[Dict[str, str]] = []
+        self.blocked_reason: Optional[str] = None
         self.status = StepStatus.PENDING
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        if self.blocked_reason:
+            raise ValueError(
+                "cannot register new steps after workflow dispatch is blocked"
+            )
         self.steps.append(step)
         self._step_map[step.id] = step
         return self
@@ -61,26 +81,168 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
+    def dispatch_step(self, workflow_id: str, step_id: str) -> bool:
+        workflow = self._workflows.get(workflow_id)
+        if not workflow:
+            return False
+
+        step = workflow.get_step(step_id)
+        if not step or not self._can_dispatch(workflow, step):
+            return False
+
+        return self._execute_step(workflow, step)
+
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
             return False
 
         workflow.status = StepStatus.RUNNING
+        completed_steps: List[WorkflowStep] = []
+
         for step in workflow.steps:
-            step.status = StepStatus.RUNNING
-            try:
-                result = step.handler()
-                step.result = result
-                step.status = StepStatus.COMPLETED
-            except Exception as e:
-                step.error = str(e)
-                step.status = StepStatus.FAILED
+            if not self._can_dispatch(workflow, step):
                 workflow.status = StepStatus.FAILED
                 return False
 
+            if self._execute_step(workflow, step):
+                completed_steps.append(step)
+                continue
+
+            partial_rollback = self._run_compensation(
+                workflow,
+                completed_steps,
+            )
+            reason = "partial_rollback" if partial_rollback else "failed_step"
+            self._block_downstream(workflow, step, reason)
+            workflow.status = StepStatus.FAILED
+            return False
+
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _can_dispatch(self, workflow: Workflow, step: WorkflowStep) -> bool:
+        if workflow.blocked_reason or step.id in workflow._blocked_step_ids:
+            step.status = StepStatus.BLOCKED
+            step.blocked_reason = workflow.blocked_reason or "dispatch_blocked"
+            self._record_audit(
+                workflow,
+                step,
+                "dispatch_blocked",
+                step.blocked_reason,
+            )
+            return False
+
+        if step.status is not StepStatus.PENDING:
+            self._record_audit(
+                workflow,
+                step,
+                "dispatch_blocked",
+                "non_pending_state",
+            )
+            return False
+
+        return True
+
+    def _execute_step(self, workflow: Workflow, step: WorkflowStep) -> bool:
+        step.status = StepStatus.RUNNING
+        self._record_audit(workflow, step, "dispatch_started", "accepted")
+
+        try:
+            step.result = step.handler()
+            step.status = StepStatus.COMPLETED
+            self._record_audit(
+                workflow,
+                step,
+                "dispatch_completed",
+                "completed",
+            )
+            return True
+        except Exception as e:
+            step.error = str(e)
+            step.status = StepStatus.FAILED
+            self._record_audit(
+                workflow,
+                step,
+                "dispatch_failed",
+                "handler_error",
+            )
+            return False
+
+    def _run_compensation(
+        self,
+        workflow: Workflow,
+        completed_steps: List[WorkflowStep],
+    ) -> bool:
+        partial_rollback = False
+
+        for step in reversed(completed_steps):
+            if not step.compensate:
+                self._record_audit(
+                    workflow,
+                    step,
+                    "compensation_skipped",
+                    "no_action",
+                )
+                continue
+
+            try:
+                step.compensate()
+                step.status = StepStatus.COMPENSATED
+                self._record_audit(
+                    workflow,
+                    step,
+                    "compensation_completed",
+                    "completed",
+                )
+            except Exception as e:
+                partial_rollback = True
+                step.status = StepStatus.COMPENSATION_FAILED
+                step.compensation_error = str(e)
+                self._record_audit(
+                    workflow,
+                    step,
+                    "compensation_failed",
+                    "handler_error",
+                )
+
+        return partial_rollback
+
+    def _block_downstream(
+        self,
+        workflow: Workflow,
+        failed_step: WorkflowStep,
+        reason: str,
+    ) -> None:
+        workflow.blocked_reason = reason
+        try:
+            start = workflow.steps.index(failed_step) + 1
+        except ValueError:
+            start = len(workflow.steps)
+
+        for step in workflow.steps[start:]:
+            if step.status is StepStatus.PENDING:
+                step.status = StepStatus.BLOCKED
+                step.blocked_reason = reason
+            workflow._blocked_step_ids.add(step.id)
+            self._record_audit(workflow, step, "downstream_blocked", reason)
+
+    def _record_audit(
+        self,
+        workflow: Workflow,
+        step: WorkflowStep,
+        event: str,
+        reason: str,
+    ) -> None:
+        workflow.audit_records.append(
+            {
+                "workflow_id": workflow.id,
+                "step_id": step.id,
+                "step_name": step.name,
+                "event": event,
+                "reason": reason,
+            }
+        )
 
 # 2019-03-27T19:58:07 update
 
