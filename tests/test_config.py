@@ -32,6 +32,63 @@ class TestConfig:
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
 
+    def test_malformed_reload_preserves_previous_valid_config(self, tmp_path):
+        good_file = tmp_path / "good.json"
+        bad_file = tmp_path / "bad.json"
+        good_file.write_text('{"app": {"name": "stable", "port": 8080}}')
+        bad_file.write_text('{"app": {"name": "broken"')
+
+        config = Config(str(good_file))
+
+        with pytest.raises(ValueError):
+            config.load(str(bad_file))
+
+        assert config.get("app.name") == "stable"
+        assert config.get("app.port") == 8080
+
+    def test_invalid_root_reload_preserves_previous_valid_config(
+        self,
+        tmp_path,
+    ):
+        good_file = tmp_path / "good.json"
+        list_file = tmp_path / "list.json"
+        good_file.write_text('{"app": {"name": "stable"}}')
+        list_file.write_text('["not", "a", "mapping"]')
+
+        config = Config(str(good_file))
+
+        with pytest.raises(ValueError, match="JSON object"):
+            config.load(str(list_file))
+
+        assert config.get("app.name") == "stable"
+
+    def test_missing_reload_file_preserves_previous_valid_config(
+        self,
+        tmp_path,
+    ):
+        good_file = tmp_path / "good.json"
+        missing_file = tmp_path / "missing.json"
+        good_file.write_text('{"app": {"name": "stable"}}')
+
+        config = Config(str(good_file))
+
+        with pytest.raises(FileNotFoundError):
+            config.load(str(missing_file))
+
+        assert config.get("app.name") == "stable"
+
+    def test_valid_reload_replaces_config_after_validation(self, tmp_path):
+        first_file = tmp_path / "first.json"
+        second_file = tmp_path / "second.json"
+        first_file.write_text('{"app": {"name": "stable"}, "old": true}')
+        second_file.write_text('{"app": {"name": "updated"}}')
+
+        config = Config(str(first_file))
+        config.load(str(second_file))
+
+        assert config.get("app.name") == "updated"
+        assert config.get("old") is None
+
 # 2019-02-01T18:58:35 update
 
 # 2019-07-31T13:45:15 update
