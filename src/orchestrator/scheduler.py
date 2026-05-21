@@ -1,10 +1,12 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
+
+
+CANCELLED_STATES = {"cancelled", "cancelling"}
 
 
 class PriorityQueue:
@@ -35,26 +37,46 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._cancelled: Dict[str, Dict] = {}
+        self._retry_audit: List[Dict[str, Any]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task.setdefault("retries", 0)
+        task.setdefault("attempt", task["retries"])
+        task.setdefault("revision", 0)
+        task.setdefault("lifecycle_state", "queued")
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -65,6 +87,7 @@ class TaskScheduler:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                task["lifecycle_state"] = "running"
                 self._in_flight[task["id"]] = task
                 return task
         return None
@@ -72,14 +95,95 @@ class TaskScheduler:
     def complete(self, task_id: str) -> bool:
         return self._in_flight.pop(task_id, None) is not None
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
+    def cancel(self, task_id: str, reason: str = "cancelled") -> bool:
         task = self._in_flight.pop(task_id, None)
+        if not task:
+            return False
+        task["lifecycle_state"] = "cancelled"
+        task["cancel_reason"] = reason
+        self._cancelled[task_id] = task
+        self._audit_retry_decision(task, "cancelled", reason)
+        return True
+
+    def fail(
+        self,
+        task_id: str,
+        queue: str = "default",
+        *,
+        expected_attempt: Optional[int] = None,
+        expected_revision: Optional[int] = None,
+    ) -> bool:
+        task = self._in_flight.get(task_id)
         if task:
+            retry_block = self._retry_block_reason(
+                task,
+                expected_attempt,
+                expected_revision,
+            )
+            if retry_block:
+                self._in_flight.pop(task_id, None)
+                task["lifecycle_state"] = "cancelled"
+                task["retry_state"] = "rejected"
+                task["retry_rejected_reason"] = retry_block
+                self._cancelled[task_id] = task
+                self._audit_retry_decision(task, "retry_rejected", retry_block)
+                return False
+
+            self._in_flight.pop(task_id, None)
             task["retries"] += 1
+            task["attempt"] = task["retries"]
+            task["revision"] = task.get("revision", 0) + 1
             if task["retries"] < self._max_retries:
+                task["lifecycle_state"] = "queued"
+                self._audit_retry_decision(task, "retry_queued", "task_failed")
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def retry_audit(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self._retry_audit]
+
+    def _retry_block_reason(
+        self,
+        task: Dict,
+        expected_attempt: Optional[int],
+        expected_revision: Optional[int],
+    ) -> Optional[str]:
+        if (
+            expected_attempt is not None
+            and task.get("attempt") != expected_attempt
+        ):
+            return "stale_attempt"
+        if (
+            expected_revision is not None
+            and task.get("revision") != expected_revision
+        ):
+            return "stale_revision"
+        if task.get("lifecycle_state") in CANCELLED_STATES:
+            return "task_cancelled"
+
+        parent_id = task.get("parent_task_id")
+        parent_state = task.get("parent_lifecycle_state")
+        parent_cancelled = parent_id in self._cancelled
+        if parent_cancelled or parent_state in CANCELLED_STATES:
+            return "parent_cancelled"
+        return None
+
+    def _audit_retry_decision(
+        self,
+        task: Dict,
+        decision: str,
+        reason: str,
+    ) -> None:
+        self._retry_audit.append({
+            "decision": decision,
+            "reason": reason,
+            "task_id": task.get("id"),
+            "parent_task_id": task.get("parent_task_id"),
+            "attempt": task.get("attempt"),
+            "revision": task.get("revision"),
+            "lifecycle_state": task.get("lifecycle_state"),
+        })
 
 # 2019-04-25T08:37:12 update
 
