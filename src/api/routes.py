@@ -1,22 +1,39 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from typing import Dict, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.run_events import (
+    DEFAULT_RUN_EVENTS_LIMIT,
+    MAX_RUN_EVENTS_LIMIT,
+    MAX_RUN_EVENTS_WINDOW,
+    RunEventStore,
+    RunEventsValidationError,
+    get_run_event_store,
+    list_run_events as list_run_events_service,
+)
 
 router = APIRouter()
 registry = AgentRegistry()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +70,30 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.get("/runs/{run_id}/events")
+async def list_run_events(
+    run_id: str,
+    workspace_id: str = Query(..., min_length=1),
+    limit: int = Query(
+        DEFAULT_RUN_EVENTS_LIMIT,
+        ge=1,
+        le=MAX_RUN_EVENTS_LIMIT,
+    ),
+    offset: int = Query(0, ge=0, le=MAX_RUN_EVENTS_WINDOW),
+    store: RunEventStore = Depends(get_run_event_store),
+):
+    try:
+        return list_run_events_service(
+            workspace_id,
+            run_id,
+            limit=limit,
+            offset=offset,
+            store=store,
+        )
+    except RunEventsValidationError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
 
 # 2019-03-18T11:10:18 update
 
