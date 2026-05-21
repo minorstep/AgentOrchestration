@@ -44,12 +44,28 @@ class TestConfig:
         monkeypatch.setenv("AO_AGENT_ID", "agent-123")
         monkeypatch.setenv("AO_API_URL", "https://api.example.test")
         monkeypatch.setenv("AO_API_KEY", "sdk-key")
+        monkeypatch.setenv("AO_CONFIG_", "ignored-empty-key")
 
         config = Config()
 
         assert config.get("agent.id") is None
         assert config.get("api.url") is None
         assert config.get("api.key") is None
+        assert "" not in config.to_dict()
+
+    def test_runtime_environment_does_not_pollute_file_config(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"agent": {"name": "worker"}}')
+        monkeypatch.setenv("AO_AGENT_ID", "runtime-agent")
+
+        config = Config(str(config_file))
+
+        assert config.get("agent.name") == "worker"
+        assert config.get("agent.id") is None
 
 # 2019-02-01T18:58:35 update
 
