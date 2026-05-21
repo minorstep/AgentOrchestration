@@ -1,4 +1,5 @@
-import pytest
+import time
+
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +36,51 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_poison_job_redelivery_is_throttled_then_dead_lettered(self):
+        scheduler = TaskScheduler(max_retries=2, redelivery_delay=0.01)
+        task_id = scheduler.enqueue({
+            "type": "crashy",
+            "payload": {"secret": "do-not-log"},
+        })
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+        assert task["id"] == task_id
+        assert scheduler.fail(task_id)
+        assert asyncio.run(scheduler.dequeue()) is None
+
+        time.sleep(0.02)
+        retry = asyncio.run(scheduler.dequeue())
+        assert retry["id"] == task_id
+        assert retry["retries"] == 1
+        assert not scheduler.fail(task_id)
+        assert scheduler.dead_lettered(task_id)["retries"] == 2
+        assert asyncio.run(scheduler.dequeue()) is None
+
+        audit_text = str(scheduler.audit_records())
+        assert "worker_crash_loop_throttle" in audit_text
+        assert "retry_limit_reached" in audit_text
+        assert "do-not-log" not in audit_text
+        assert "payload" not in audit_text
+
+    def test_duplicate_failure_ack_does_not_redeliver_twice(self):
+        scheduler = TaskScheduler(max_retries=3, redelivery_delay=0.01)
+        task_id = scheduler.enqueue({"type": "crashy"})
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+        assert scheduler.fail(task["id"])
+        assert not scheduler.fail(task["id"])
+
+        time.sleep(0.02)
+        retry = asyncio.run(scheduler.dequeue())
+        assert retry["id"] == task_id
+        assert asyncio.run(scheduler.dequeue()) is None
+
+        audit_text = str(scheduler.audit_records())
+        assert "redelivery_ignored" in audit_text
+        assert "not_in_flight" in audit_text
 
 # 2019-01-09T19:07:03 update
 

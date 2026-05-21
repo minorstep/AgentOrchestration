@@ -1,10 +1,12 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
+from copy import deepcopy
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
+
+from src.common.metrics import metrics
 
 
 class PriorityQueue:
@@ -31,36 +33,93 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        max_retries: int = 3,
+        redelivery_delay: float = 1.0,
+        max_redelivery_delay: float = 30.0,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
-        self._max_retries = 3
+        self._dead_letters: Dict[str, Dict] = {}
+        self._audit_records: List[Dict[str, Any]] = []
+        self._max_retries = max_retries
+        self._redelivery_delay = redelivery_delay
+        self._max_redelivery_delay = max_redelivery_delay
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+        preserve_identity: bool = False,
+    ) -> str:
+        task_id = task.get("id") if preserve_identity else None
+        if not task_id:
+            task_id = str(uuid4())
+            task["retries"] = 0
         task["id"] = task_id
+        task["queue"] = queue
+        task["priority"] = priority
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_id = self.enqueue_metadata(task, queue, priority)
+        self._scheduled[task_id] = {
+            "task": task,
+            "queue": queue,
+            "priority": priority,
+            "due_at": time.time() + delay,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    def enqueue_metadata(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_id = task.get("id") or str(uuid4())
+        task["id"] = task_id
+        task.setdefault("retries", 0)
+        task["queue"] = queue
+        task["priority"] = priority
+        return task_id
+
+    def _release_due_tasks(self) -> None:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
-        for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+        due_ids = [
+            task_id
+            for task_id, entry in self._scheduled.items()
+            if entry["due_at"] <= now
+        ]
+        for task_id in due_ids:
+            entry = self._scheduled.pop(task_id)
+            self.enqueue(
+                entry["task"],
+                entry["queue"],
+                entry["priority"],
+                preserve_identity=True,
+            )
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        self._release_due_tasks()
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
@@ -74,12 +133,77 @@ class TaskScheduler:
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
-        return False
+        if not task:
+            self._audit("redelivery_ignored", task_id, queue, "not_in_flight")
+            return False
+
+        queue = task.get("queue", queue)
+        priority = task.get("priority", 0)
+        task["retries"] = task.get("retries", 0) + 1
+
+        if task["retries"] >= self._max_retries:
+            self._dead_letters[task_id] = deepcopy(task)
+            self._audit(
+                "poison_dead_lettered",
+                task_id,
+                queue,
+                "retry_limit_reached",
+            )
+            metrics.increment("scheduler.poison_dead_lettered")
+            return False
+
+        delay = self._next_redelivery_delay(task["retries"])
+        self._scheduled[task_id] = {
+            "task": task,
+            "queue": queue,
+            "priority": priority,
+            "due_at": time.time() + delay,
+        }
+        self._audit(
+            "redelivery_deferred",
+            task_id,
+            queue,
+            "worker_crash_loop_throttle",
+            delay=delay,
+            retries=task["retries"],
+        )
+        metrics.increment("scheduler.redelivery_deferred")
+        return True
+
+    def dead_lettered(self, task_id: str) -> Optional[Dict]:
+        task = self._dead_letters.get(task_id)
+        return deepcopy(task) if task else None
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return deepcopy(self._audit_records)
+
+    def _next_redelivery_delay(self, retries: int) -> float:
+        return min(
+            self._redelivery_delay * (2 ** max(retries - 1, 0)),
+            self._max_redelivery_delay,
+        )
+
+    def _audit(
+        self,
+        event: str,
+        task_id: str,
+        queue: str,
+        reason: str,
+        delay: float = 0.0,
+        retries: Optional[int] = None,
+    ) -> None:
+        record: Dict[str, Any] = {
+            "event": event,
+            "task_id": task_id,
+            "queue": queue,
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        if delay:
+            record["delay"] = delay
+        if retries is not None:
+            record["retries"] = retries
+        self._audit_records.append(record)
 
 # 2019-04-25T08:37:12 update
 
