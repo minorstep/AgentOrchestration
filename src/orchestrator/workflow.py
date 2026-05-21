@@ -1,8 +1,14 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+from copy import deepcopy
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+import logging
+import re
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
+
+
+logger = logging.getLogger(__name__)
 
 
 class StepStatus(Enum):
@@ -13,28 +19,174 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class ReservedMetadataKeyError(ValueError):
+    def __init__(self, key_path: str):
+        self.key_path = key_path
+        super().__init__(f"Reserved metadata key is not allowed: {key_path}")
+
+
+RESERVED_METADATA_KEYS = frozenset(
+    {
+        "agent_id",
+        "agentid",
+        "agent_type",
+        "agenttype",
+        "attempt",
+        "children",
+        "completed_at",
+        "completedat",
+        "created_at",
+        "createdat",
+        "error",
+        "handler",
+        "id",
+        "lifecycle",
+        "lifecycle_state",
+        "lifecyclestate",
+        "parent_id",
+        "parentid",
+        "parent_workflow_id",
+        "parentworkflowid",
+        "priority",
+        "queue",
+        "result",
+        "retries",
+        "revision",
+        "route",
+        "routing",
+        "scheduled_at",
+        "scheduledat",
+        "started_at",
+        "startedat",
+        "state",
+        "status",
+        "step_id",
+        "stepid",
+        "step_map",
+        "stepmap",
+        "steps",
+        "task_id",
+        "taskid",
+        "timeout",
+        "updated_at",
+        "updatedat",
+        "workflow_id",
+        "workflowid",
+    }
+)
+
+
+def _normalise_metadata_key(key: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(key).strip().lower()).strip("_")
+
+
+def _reserved_metadata_violation(
+    metadata: Any,
+    path: str = "",
+) -> Optional[str]:
+    if isinstance(metadata, dict):
+        for key, value in metadata.items():
+            key_path = f"{path}.{key}" if path else str(key)
+            if _normalise_metadata_key(key) in RESERVED_METADATA_KEYS:
+                return key_path
+
+            nested_violation = _reserved_metadata_violation(value, key_path)
+            if nested_violation:
+                return nested_violation
+    elif isinstance(metadata, list):
+        for index, value in enumerate(metadata):
+            nested_violation = _reserved_metadata_violation(
+                value,
+                f"{path}[{index}]",
+            )
+            if nested_violation:
+                return nested_violation
+
+    return None
+
+
+def _validate_user_metadata(
+    metadata: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if metadata is None:
+        return {}
+    if not isinstance(metadata, dict):
+        raise TypeError("workflow metadata must be a dictionary")
+
+    violation = _reserved_metadata_violation(metadata)
+    if violation:
+        raise ReservedMetadataKeyError(violation)
+
+    return deepcopy(metadata)
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self._metadata = _validate_user_metadata(metadata)
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
 
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        return deepcopy(self._metadata)
+
+    @metadata.setter
+    def metadata(self, value: Optional[Dict[str, Any]]) -> None:
+        self._metadata = _validate_user_metadata(value)
+
 
 class Workflow:
-    def __init__(self, name: str, description: str = ""):
+    def __init__(
+        self,
+        name: str,
+        description: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+        audit_callback: Optional[Callable[[str, Dict[str, str]], None]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.description = description
+        self._metadata = _validate_user_metadata(metadata)
+        self._audit_callback = audit_callback
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
 
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        return deepcopy(self._metadata)
+
+    @metadata.setter
+    def metadata(self, value: Optional[Dict[str, Any]]) -> None:
+        self._metadata = _validate_user_metadata(value)
+
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        violation = _reserved_metadata_violation(step._metadata)
+        if violation:
+            self._audit(
+                "workflow_step_rejected",
+                {
+                    "reason": "reserved_metadata_key",
+                    "key_path": violation,
+                    "workflow_status": self.status.value,
+                    "step_status": step.status.value,
+                },
+            )
+            raise ReservedMetadataKeyError(violation)
+
         self.steps.append(step)
         self._step_map[step.id] = step
         return self
@@ -42,13 +194,41 @@ class Workflow:
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
 
+    def _audit(self, event: str, details: Dict[str, str]) -> None:
+        if self._audit_callback:
+            details["workflow_id"] = self.id
+            self._audit_callback(event, details)
+
 
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self._audit_log: List[Dict[str, str]] = []
 
-    def create_workflow(self, name: str, description: str = "") -> Workflow:
-        workflow = Workflow(name, description)
+    @property
+    def audit_log(self) -> List[Dict[str, str]]:
+        return deepcopy(self._audit_log)
+
+    def create_workflow(
+        self,
+        name: str,
+        description: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Workflow:
+        try:
+            workflow = Workflow(
+                name,
+                description,
+                metadata,
+                self._record_audit,
+            )
+        except ReservedMetadataKeyError as exc:
+            self._record_audit(
+                "workflow_registration_rejected",
+                {"reason": "reserved_metadata_key", "key_path": exc.key_path},
+            )
+            raise
+
         self._workflows[workflow.id] = workflow
         return workflow
 
@@ -66,6 +246,20 @@ class WorkflowManager:
         if not workflow:
             return False
 
+        violation = self._definition_metadata_violation(workflow)
+        if violation:
+            key_path, status_before = violation
+            self._record_audit(
+                "workflow_execution_deferred",
+                {
+                    "reason": "reserved_metadata_key",
+                    "key_path": key_path,
+                    "workflow_id": workflow.id,
+                    "workflow_status": status_before,
+                },
+            )
+            return False
+
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
@@ -81,6 +275,33 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _definition_metadata_violation(
+        self, workflow: Workflow
+    ) -> Optional[Tuple[str, str]]:
+        violation = _reserved_metadata_violation(workflow._metadata)
+        if violation:
+            return violation, workflow.status.value
+
+        for step in workflow.steps:
+            violation = _reserved_metadata_violation(step._metadata)
+            if violation:
+                return f"{step.name}.{violation}", workflow.status.value
+
+        return None
+
+    def _record_audit(self, event: str, details: Dict[str, str]) -> None:
+        record = {"event": event, **details}
+        self._audit_log.append(record)
+        logger.warning(
+            "Workflow metadata decision: %s",
+            event,
+            extra={
+                key: value
+                for key, value in record.items()
+                if key != "event"
+            },
+        )
 
 # 2019-03-27T19:58:07 update
 
