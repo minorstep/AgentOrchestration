@@ -2,7 +2,7 @@
 
 from typing import Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 from src.agent import AgentRegistry, AgentStatus
 from src.api.run_events import (
@@ -13,6 +13,7 @@ from src.api.run_events import (
     RunEventsValidationError,
     get_run_event_store,
     list_run_events as list_run_events_service,
+    resolve_workspace_id,
 )
 
 router = APIRouter()
@@ -75,7 +76,8 @@ async def agent_count():
 @router.get("/runs/{run_id}/events")
 async def list_run_events(
     run_id: str,
-    workspace_id: str = Query(..., min_length=1),
+    workspace_id: Optional[str] = Query(None, min_length=1),
+    workspace_header: Optional[str] = Header(None, alias="X-Workspace-Id"),
     limit: int = Query(
         DEFAULT_RUN_EVENTS_LIMIT,
         ge=1,
@@ -85,8 +87,12 @@ async def list_run_events(
     store: RunEventStore = Depends(get_run_event_store),
 ):
     try:
-        return list_run_events_service(
+        resolved_workspace_id = resolve_workspace_id(
             workspace_id,
+            workspace_header,
+        )
+        return list_run_events_service(
+            resolved_workspace_id,
             run_id,
             limit=limit,
             offset=offset,

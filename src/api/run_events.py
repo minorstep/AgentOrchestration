@@ -86,6 +86,23 @@ def list_run_events(
     }
 
 
+def resolve_workspace_id(
+    query_workspace_id: str = None,
+    header_workspace_id: str = None,
+) -> str:
+    query_value = _normalise_optional_scope(query_workspace_id)
+    header_value = _normalise_optional_scope(header_workspace_id)
+    if query_value and header_value and query_value != header_value:
+        raise RunEventsValidationError(
+            422,
+            "workspace_id query and X-Workspace-Id header must match",
+        )
+    workspace_id = header_value or query_value
+    if not workspace_id:
+        raise RunEventsValidationError(422, "workspace_id is required")
+    return workspace_id
+
+
 def _validate_run_event_request(
     workspace_id: str,
     run_id: str,
@@ -110,3 +127,9 @@ def _validate_run_event_request(
             422,
             f"offset plus limit must not exceed {MAX_RUN_EVENTS_WINDOW}",
         )
+
+
+def _normalise_optional_scope(value: str = None) -> str:
+    if value is None:
+        return ""
+    return value.strip()
