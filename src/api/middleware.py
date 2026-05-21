@@ -2,21 +2,105 @@
 
 import time
 import logging
+import os
 from typing import Callable
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+from src.common.auth import JWTAuthError, validate_service_token
+
 logger = logging.getLogger(__name__)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    def __init__(
+        self,
+        app,
+        jwt_secret: str = None,
+        worker_audience: str = "agent-workers",
+    ):
+        super().__init__(app)
+        self.jwt_secret = jwt_secret
+        self.worker_audience = worker_audience
+        self.revoked_tokens = set()
+        self.revoked_jti = set()
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if self._requires_worker_auth(request):
+            token = self._extract_token(request)
+            if not token:
+                return Response(status_code=401, content="Unauthorized")
+
+            try:
+                claims = validate_service_token(
+                    token,
+                    secret=self.jwt_secret,
+                    audience=self.worker_audience,
+                    required_scope="agent:worker",
+                    required_role="workspace:worker",
+                    revoked_tokens=(
+                        self.revoked_tokens | _env_set("AO_JWT_REVOKED_TOKENS")
+                    ),
+                    revoked_jti=(
+                        self.revoked_jti | _env_set("AO_JWT_REVOKED_JTI")
+                    ),
+                )
+            except JWTAuthError as exc:
+                status_code = (
+                    401
+                    if exc.code
+                    in {
+                        "malformed",
+                        "missing_secret",
+                        "revoked",
+                        "stale",
+                        "wrong_audience",
+                    }
+                    else 403
+                )
+                return Response(
+                    status_code=status_code,
+                    content="Unauthorized",
+                )
+
+            request.state.principal = claims
+
+        elif (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
         return await call_next(request)
+
+    def revoke_token(self, token: str) -> None:
+        self.revoked_tokens.add(token)
+
+    def revoke_jti(self, jti: str) -> None:
+        self.revoked_jti.add(jti)
+
+    def _requires_worker_auth(self, request: Request) -> bool:
+        return request.url.path.startswith("/api/v2/agents")
+
+    def _extract_token(self, request: Request) -> str:
+        authorization = request.headers.get("Authorization", "")
+        if authorization.startswith("Bearer "):
+            return authorization[len("Bearer "):].strip()
+        return request.cookies.get("ao_session", "").strip()
+
+
+def _env_set(name: str) -> set:
+    return {
+        value.strip()
+        for value in os.getenv(name, "").split(",")
+        if value.strip()
+    }
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -26,14 +110,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +133,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
