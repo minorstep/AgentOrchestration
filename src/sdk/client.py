@@ -45,6 +45,7 @@ class OrchestratorClient:
         return normalized
 
     def _headers(self) -> Dict[str, str]:
+        self.api_key = self._resolve_api_key(self.api_key)
         return {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",

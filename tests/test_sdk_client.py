@@ -104,3 +104,25 @@ class TestOrchestratorClientAuthSetup:
 
         assert client.list_agents() == {"agents": []}
         assert captured["headers"]["Authorization"] == "Bearer env-secret"
+
+    def test_mutated_blank_api_key_fails_before_late_request(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("AO_API_KEY", raising=False)
+
+        def forbidden_urlopen(req):
+            raise AssertionError(
+                "request should not be created with a blank key"
+            )
+
+        monkeypatch.setattr("src.sdk.client.urlopen", forbidden_urlopen)
+
+        client = OrchestratorClient(
+            base_url="https://example.test",
+            api_key="initial-secret",
+        )
+        client.api_key = " "
+
+        with pytest.raises(AuthenticationError):
+            client.list_agents()
