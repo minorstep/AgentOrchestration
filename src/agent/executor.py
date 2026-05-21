@@ -11,25 +11,53 @@ class AgentExecutor:
         self.max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_tasks: Dict[str, asyncio.Task] = {}
+        self._active_context: Dict[str, Dict[str, Any]] = {}
         self._results: Dict[str, Any] = {}
 
-    async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
+    async def execute(
+        self,
+        agent_id: str,
+        task: Dict[str, Any],
+        handler: Callable,
+    ) -> str:
         execution_id = str(uuid4())
         async with self._semaphore:
             task_obj = asyncio.create_task(
                 self._run_execution(execution_id, agent_id, task, handler)
             )
             self._active_tasks[execution_id] = task_obj
+            self._active_context[execution_id] = {
+                "agent_id": agent_id,
+                "task_id": task.get("id"),
+            }
             try:
                 result = await task_obj
-                self._results[execution_id] = result
+                self._record_terminal_result(execution_id, result)
+            except asyncio.CancelledError:
+                self._record_failure(
+                    execution_id,
+                    "cancelled",
+                    "execution_cancelled",
+                )
             except Exception as e:
-                self._results[execution_id] = {"error": str(e)}
+                self._record_failure(
+                    execution_id,
+                    "failed",
+                    str(e),
+                    type(e).__name__,
+                )
             finally:
                 self._active_tasks.pop(execution_id, None)
+                self._active_context.pop(execution_id, None)
         return execution_id
 
-    async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
+    async def _run_execution(
+        self,
+        exec_id: str,
+        agent_id: str,
+        task: Dict,
+        handler: Callable,
+    ) -> Any:
         start = time.time()
         result = await handler(agent_id, task)
         duration = time.time() - start
@@ -45,18 +73,59 @@ class AgentExecutor:
     def get_result(self, execution_id: str) -> Optional[Any]:
         return self._results.get(execution_id)
 
-    def cancel(self, execution_id: str) -> bool:
+    def active_executions(self) -> Dict[str, Dict[str, Any]]:
+        return {
+            execution_id: dict(context)
+            for execution_id, context in self._active_context.items()
+        }
+
+    def cancel(
+        self,
+        execution_id: str,
+        reason: str = "cancelled",
+    ) -> bool:
         task = self._active_tasks.get(execution_id)
         if task and not task.done():
+            self._record_failure(execution_id, "cancelled", reason)
             task.cancel()
             return True
         return False
 
-    async def shutdown(self) -> None:
-        for task in self._active_tasks.values():
-            task.cancel()
+    async def shutdown(self, reason: str = "worker_shutdown") -> None:
+        for execution_id, task in list(self._active_tasks.items()):
+            if not task.done():
+                self._record_failure(execution_id, "failed", reason)
+                task.cancel()
         if self._active_tasks:
-            await asyncio.gather(*self._active_tasks.values(), return_exceptions=True)
+            await asyncio.gather(
+                *self._active_tasks.values(),
+                return_exceptions=True,
+            )
+
+    def _record_terminal_result(self, execution_id: str, result: Any) -> None:
+        self._results.setdefault(execution_id, result)
+
+    def _record_failure(
+        self,
+        execution_id: str,
+        status: str,
+        reason: str,
+        error_type: str = "RuntimeLifecycleError",
+    ) -> None:
+        context = self._active_context.get(execution_id, {})
+        self._record_terminal_result(
+            execution_id,
+            {
+                "execution_id": execution_id,
+                "agent_id": context.get("agent_id"),
+                "task_id": context.get("task_id"),
+                "status": status,
+                "reason": reason,
+                "error": reason,
+                "error_type": error_type,
+                "timestamp": time.time(),
+            },
+        )
 
 # 2019-01-31T14:19:34 update
 
