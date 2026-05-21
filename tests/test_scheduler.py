@@ -54,15 +54,13 @@ class TestTaskScheduler:
         )
 
         audit = self.scheduler.retry_audit()[-1]
-        assert audit == {
-            "decision": "retry_rejected",
-            "reason": "parent_cancelled",
-            "task_id": child_id,
-            "parent_task_id": parent_id,
-            "attempt": 0,
-            "revision": 0,
-            "lifecycle_state": "cancelled",
-        }
+        assert audit["decision"] == "retry_rejected"
+        assert audit["reason"] == "parent_cancelled"
+        assert audit["task_id"] == child_id
+        assert audit["parent_task_id"] == parent_id
+        assert audit["attempt"] == 0
+        assert audit["revision"] == 0
+        assert audit["lifecycle_state"] == "cancelled"
         assert "payload" not in audit
 
     def test_stale_attempt_does_not_commit_retry(self):
@@ -107,6 +105,105 @@ class TestTaskScheduler:
         audit = self.scheduler.retry_audit()[-1]
         assert audit["reason"] == "parent_cancelled"
         assert audit["task_id"] == child_id
+
+    def test_matching_parent_attempt_and_revision_can_retry(self):
+        child_id = self.scheduler.enqueue({
+            "type": "child",
+            "parent_task_id": "parent-1",
+            "parent_lifecycle_state": "running",
+            "parent_attempt": 2,
+            "parent_revision": 5,
+        })
+        import asyncio
+        asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(
+            child_id,
+            expected_parent_attempt=2,
+            expected_parent_revision=5,
+        )
+
+        audit = self.scheduler.retry_audit()[-1]
+        assert audit["decision"] == "retry_queued"
+        assert audit["reason"] == "task_failed"
+
+    def test_stale_parent_attempt_does_not_commit_retry(self):
+        child_id = self.scheduler.enqueue({
+            "type": "child",
+            "parent_task_id": "parent-1",
+            "parent_lifecycle_state": "running",
+            "parent_attempt": 1,
+            "parent_revision": 5,
+        })
+        import asyncio
+        child = asyncio.run(self.scheduler.dequeue())
+
+        assert not self.scheduler.fail(
+            child_id,
+            expected_parent_attempt=2,
+            expected_parent_revision=5,
+        )
+
+        audit = self.scheduler.retry_audit()[-1]
+        assert audit["decision"] == "retry_rejected"
+        assert audit["reason"] == "stale_parent_attempt"
+        assert audit["parent_attempt"] == child["parent_attempt"]
+        assert child["lifecycle_state"] == "cancelled"
+
+    def test_stale_parent_revision_does_not_commit_retry(self):
+        child_id = self.scheduler.enqueue({
+            "type": "child",
+            "parent_task_id": "parent-1",
+            "parent_lifecycle_state": "running",
+            "parent_attempt": 1,
+            "parent_revision": 4,
+        })
+        import asyncio
+        child = asyncio.run(self.scheduler.dequeue())
+
+        assert not self.scheduler.fail(
+            child_id,
+            expected_parent_attempt=1,
+            expected_parent_revision=5,
+        )
+
+        audit = self.scheduler.retry_audit()[-1]
+        assert audit["decision"] == "retry_rejected"
+        assert audit["reason"] == "stale_parent_revision"
+        assert audit["parent_revision"] == child["parent_revision"]
+        assert child["lifecycle_state"] == "cancelled"
+
+    def test_missing_parent_lifecycle_fails_closed(self):
+        child_id = self.scheduler.enqueue({
+            "type": "child",
+            "parent_task_id": "parent-1",
+        })
+        import asyncio
+        child = asyncio.run(self.scheduler.dequeue())
+
+        assert not self.scheduler.fail(child_id)
+
+        audit = self.scheduler.retry_audit()[-1]
+        assert audit["decision"] == "retry_rejected"
+        assert audit["reason"] == "missing_parent_lifecycle"
+        assert child["lifecycle_state"] == "cancelled"
+
+    def test_scheduled_task_preserves_task_id_queue_and_priority(self):
+        task_id = self.scheduler.schedule(
+            {"type": "scheduled"},
+            delay=-1,
+            queue="critical",
+            priority=20,
+        )
+        self.scheduler.enqueue({"type": "low"}, queue="critical", priority=1)
+        import asyncio
+
+        assert asyncio.run(self.scheduler.dequeue()) is None
+        task = asyncio.run(self.scheduler.dequeue("critical"))
+
+        assert task["id"] == task_id
+        assert task["type"] == "scheduled"
+        assert task["lifecycle_state"] == "running"
 
 # 2019-01-09T19:07:03 update
 

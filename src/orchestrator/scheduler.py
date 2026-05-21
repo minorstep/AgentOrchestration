@@ -35,7 +35,7 @@ class PriorityQueue:
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._cancelled: Dict[str, Dict] = {}
         self._retry_audit: List[Dict[str, Any]] = []
@@ -48,16 +48,8 @@ class TaskScheduler:
         priority: int = 0,
     ) -> str:
         task_id = str(uuid4())
-        task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task.setdefault("retries", 0)
-        task.setdefault("attempt", task["retries"])
-        task.setdefault("revision", 0)
-        task.setdefault("lifecycle_state", "queued")
-
-        if queue not in self._queues:
-            self._queues[queue] = PriorityQueue()
-        self._queues[queue].push(task, priority)
+        self._prepare_task(task, task_id)
+        self._push_task(task, queue, priority)
         return task_id
 
     def schedule(
@@ -68,8 +60,17 @@ class TaskScheduler:
         priority: int = 0,
     ) -> str:
         task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        run_at = time.time() + delay
+        self._prepare_task(task, task_id)
+        task["lifecycle_state"] = "scheduled"
+        task["scheduled_at"] = time.time()
+        task["scheduled_for"] = run_at
+        self._scheduled[task_id] = {
+            "run_at": run_at,
+            "task": task,
+            "queue": queue,
+            "priority": priority,
+        }
         return task_id
 
     async def dequeue(
@@ -78,11 +79,21 @@ class TaskScheduler:
         timeout: float = 1.0,
     ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [
+            tid
+            for tid, scheduled in self._scheduled.items()
+            if scheduled["run_at"] <= now and scheduled["queue"] == queue
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            scheduled = self._scheduled.pop(tid)
+            task = scheduled["task"]
+            task["lifecycle_state"] = "queued"
+            task["enqueued_at"] = now
+            self._push_task(
+                task,
+                scheduled["queue"],
+                scheduled["priority"],
+            )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
@@ -112,6 +123,8 @@ class TaskScheduler:
         *,
         expected_attempt: Optional[int] = None,
         expected_revision: Optional[int] = None,
+        expected_parent_attempt: Optional[int] = None,
+        expected_parent_revision: Optional[int] = None,
     ) -> bool:
         task = self._in_flight.get(task_id)
         if task:
@@ -119,6 +132,8 @@ class TaskScheduler:
                 task,
                 expected_attempt,
                 expected_revision,
+                expected_parent_attempt,
+                expected_parent_revision,
             )
             if retry_block:
                 self._in_flight.pop(task_id, None)
@@ -148,6 +163,8 @@ class TaskScheduler:
         task: Dict,
         expected_attempt: Optional[int],
         expected_revision: Optional[int],
+        expected_parent_attempt: Optional[int],
+        expected_parent_revision: Optional[int],
     ) -> Optional[str]:
         if (
             expected_attempt is not None
@@ -167,6 +184,14 @@ class TaskScheduler:
         parent_cancelled = parent_id in self._cancelled
         if parent_cancelled or parent_state in CANCELLED_STATES:
             return "parent_cancelled"
+        if expected_parent_attempt is not None:
+            if task.get("parent_attempt") != expected_parent_attempt:
+                return "stale_parent_attempt"
+        if expected_parent_revision is not None:
+            if task.get("parent_revision") != expected_parent_revision:
+                return "stale_parent_revision"
+        if parent_id and parent_state is None and not parent_cancelled:
+            return "missing_parent_lifecycle"
         return None
 
     def _audit_retry_decision(
@@ -182,8 +207,24 @@ class TaskScheduler:
             "parent_task_id": task.get("parent_task_id"),
             "attempt": task.get("attempt"),
             "revision": task.get("revision"),
+            "parent_attempt": task.get("parent_attempt"),
+            "parent_revision": task.get("parent_revision"),
+            "parent_lifecycle_state": task.get("parent_lifecycle_state"),
             "lifecycle_state": task.get("lifecycle_state"),
         })
+
+    def _prepare_task(self, task: Dict, task_id: str) -> None:
+        task["id"] = task_id
+        task["enqueued_at"] = time.time()
+        task.setdefault("retries", 0)
+        task.setdefault("attempt", task["retries"])
+        task.setdefault("revision", 0)
+        task.setdefault("lifecycle_state", "queued")
+
+    def _push_task(self, task: Dict, queue: str, priority: int = 0) -> None:
+        if queue not in self._queues:
+            self._queues[queue] = PriorityQueue()
+        self._queues[queue].push(task, priority)
 
 # 2019-04-25T08:37:12 update
 
