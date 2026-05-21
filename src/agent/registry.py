@@ -1,5 +1,6 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
+import hashlib
 import json
 import time
 import uuid
@@ -16,13 +17,24 @@ class AgentStatus(Enum):
     TERMINATED = "terminated"
 
 
+class ConfigUpdateError(Exception):
+    def __init__(self, status_code: int, detail: str):
+        self.status_code = status_code
+        self.detail = detail
+
+
 class AgentRegistry:
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -31,11 +43,15 @@ class AgentRegistry:
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
             "config": config or {},
+            "config_revision": 1,
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
             "metrics": {"tasks_completed": 0, "errors": 0, "uptime": 0},
         }
+        self._agents[agent_id]["etag"] = self._config_etag(
+            self._agents[agent_id],
+        )
         group = agent_type.split(".")[0]
         if group not in self._index:
             self._index[group] = []
@@ -45,14 +61,18 @@ class AgentRegistry:
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
-        agents = self._agents.values()
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        agents: List[Dict[str, Any]] = list(self._agents.values())
         if status:
             agents = [a for a in agents if a["status"] == status.value]
         if group:
             agent_ids = self._index.get(group, [])
             agents = [a for a in agents if a["id"] in agent_ids]
-        return list(agents)
+        return agents
 
     def update_status(self, agent_id: str, status: AgentStatus) -> bool:
         if agent_id not in self._agents:
@@ -60,6 +80,73 @@ class AgentRegistry:
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
         return True
+
+    def update_config(
+        self,
+        agent_id: str,
+        config: Dict[str, Any],
+        if_match: Optional[str],
+    ) -> Dict[str, Any]:
+        normalized_etag = self._validate_config_update_input(
+            agent_id,
+            config,
+            if_match,
+        )
+        agent = self._agents.get(agent_id)
+        if agent is None:
+            raise ConfigUpdateError(404, "Agent not found")
+        if normalized_etag != self._normalize_etag(agent["etag"]):
+            raise ConfigUpdateError(412, "Stale agent config ETag")
+
+        agent["config"] = dict(config)
+        agent["config_revision"] += 1
+        agent["updated_at"] = time.time()
+        agent["etag"] = self._config_etag(agent)
+        return {
+            "agent_id": agent_id,
+            "config": dict(agent["config"]),
+            "etag": agent["etag"],
+            "config_revision": agent["config_revision"],
+        }
+
+    def _validate_config_update_input(
+        self,
+        agent_id: str,
+        config: Dict[str, Any],
+        if_match: Optional[str],
+    ) -> str:
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            raise ConfigUpdateError(400, "Invalid agent id")
+        if not isinstance(config, dict):
+            raise ConfigUpdateError(400, "Config body must be an object")
+        if if_match is None:
+            raise ConfigUpdateError(428, "If-Match header required")
+        return self._normalize_etag(if_match)
+
+    @staticmethod
+    def _normalize_etag(etag: str) -> str:
+        if not isinstance(etag, str):
+            raise ConfigUpdateError(400, "Invalid ETag")
+        stripped = etag.strip()
+        if stripped.startswith("W/"):
+            raise ConfigUpdateError(400, "Weak ETags are not accepted")
+        if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
+            stripped = stripped[1:-1]
+        if not stripped or any(char.isspace() for char in stripped):
+            raise ConfigUpdateError(400, "Invalid ETag")
+        return stripped
+
+    def _config_etag(self, agent: Dict[str, Any]) -> str:
+        payload = json.dumps(
+            {
+                "config": agent["config"],
+                "revision": agent["config_revision"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+        return f'"{digest}"'
 
     def delete(self, agent_id: str) -> bool:
         if agent_id not in self._agents:
