@@ -14,6 +14,14 @@ class TestOnEvent:
 
         assert wrapped.__event_handler__ == "user.created"
 
+    def test_on_event_normalizes_surrounding_whitespace(self):
+        async def handle_user_created():
+            return "handled"
+
+        wrapped = on_event("  user.created  ")(handle_user_created)
+
+        assert wrapped.__event_handler__ == "user.created"
+
     def test_on_event_preserves_wrapped_handler_behaviour(self):
         seen_payloads = []
 

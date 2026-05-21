@@ -46,7 +46,7 @@ def agent(name: str, version: str = "1.0.0", description: str = ""):
 def _validate_event_type(event_type: str) -> str:
     if not isinstance(event_type, str) or not event_type.strip():
         raise ValueError("event_type must be a non-empty string")
-    return event_type
+    return event_type.strip()
 
 
 def on_event(event_type: str):
