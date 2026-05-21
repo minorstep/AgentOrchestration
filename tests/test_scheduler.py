@@ -1,3 +1,5 @@
+import asyncio
+
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -11,7 +13,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -19,19 +20,16 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
 
@@ -40,7 +38,6 @@ class TestTaskScheduler:
         self.scheduler.enqueue({"type": "second", "tenant_id": "acme"})
         self.scheduler.enqueue({"type": "other", "tenant_id": "globex"})
 
-        import asyncio
         first = asyncio.run(self.scheduler.dequeue())
         other = asyncio.run(self.scheduler.dequeue())
         blocked = asyncio.run(self.scheduler.dequeue())
@@ -73,16 +70,59 @@ class TestTaskScheduler:
 
         audit_records = self.scheduler.audit_records
         assert audit_records[0]["decision"] == "recovered"
+        assert audit_records[0]["source"] == "restart_recovery"
         assert audit_records[1]["decision"] == "deferred"
         assert audit_records[1]["reason"] == "tenant_concurrency_limit"
+        assert audit_records[1]["source"] == "restart_recovery"
         assert "payload" not in audit_records[1]
         assert "secret" not in str(audit_records)
 
-        import asyncio
         assert asyncio.run(self.scheduler.dequeue()) is None
         assert self.scheduler.complete("task-1")
         recovered_after_capacity_frees = asyncio.run(self.scheduler.dequeue())
         assert recovered_after_capacity_frees["id"] == "task-2"
+        assert recovered_after_capacity_frees["recovery_state"] == "deferred"
+        assert (
+            recovered_after_capacity_frees["deferred_reason"]
+            == "tenant_concurrency_limit"
+        )
+
+    def test_recovery_skips_duplicate_in_flight_task_id(self):
+        recovered = self.scheduler.recover_in_flight([
+            {"id": "task-1", "type": "recover", "tenant_id": "acme"},
+        ])
+
+        assert recovered == ["task-1"]
+
+        duplicate_recovered = self.scheduler.recover_in_flight([
+            {"id": "task-1", "type": "recover", "tenant_id": "acme"},
+        ])
+
+        assert duplicate_recovered == []
+        assert self.scheduler.audit_records[-1]["decision"] == "skipped"
+        assert (
+            self.scheduler.audit_records[-1]["reason"]
+            == "already_in_flight"
+        )
+        assert self.scheduler.audit_records[-1]["source"] == "restart_recovery"
+
+    def test_recovery_counts_existing_in_flight_tenant_capacity(self):
+        active_id = self.scheduler.enqueue({
+            "type": "active",
+            "tenant_id": "acme",
+        })
+        assert asyncio.run(self.scheduler.dequeue())["id"] == active_id
+
+        recovered = self.scheduler.recover_in_flight([
+            {"id": "task-1", "type": "recover", "tenant_id": "acme"},
+        ])
+
+        assert recovered == []
+        assert self.scheduler.audit_records[-1]["decision"] == "deferred"
+        assert (
+            self.scheduler.audit_records[-1]["reason"]
+            == "tenant_concurrency_limit"
+        )
 
 # 2019-01-09T19:07:03 update
 

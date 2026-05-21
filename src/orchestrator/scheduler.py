@@ -132,12 +132,17 @@ class TaskScheduler:
             task = self._queues[queue].pop_matching(self._can_dispatch)
             if task:
                 self._in_flight[task["id"]] = task
-                self._record_audit("dispatched", task)
+                self._record_audit(
+                    "dispatched",
+                    task,
+                    source="queued_dispatch",
+                )
                 return task
             self._record_audit(
                 "deferred",
                 {"queue": queue},
                 "tenant_concurrency_limit",
+                source="queued_dispatch",
             )
         return None
 
@@ -170,16 +175,32 @@ class TaskScheduler:
             task.setdefault("queue", queue)
             task.setdefault("priority", 0)
 
+            if task["id"] in self._in_flight:
+                self._record_audit(
+                    "skipped",
+                    task,
+                    "already_in_flight",
+                    source="restart_recovery",
+                )
+                continue
+
             if self._can_dispatch(task):
                 self._in_flight[task["id"]] = task
                 recovered.append(task["id"])
-                self._record_audit("recovered", task)
+                self._record_audit(
+                    "recovered",
+                    task,
+                    source="restart_recovery",
+                )
             else:
+                task["recovery_state"] = "deferred"
+                task["deferred_reason"] = "tenant_concurrency_limit"
                 self._enqueue_existing(task, task["queue"], task["priority"])
                 self._record_audit(
                     "deferred",
                     task,
                     "tenant_concurrency_limit",
+                    source="restart_recovery",
                 )
         return recovered
 
@@ -214,12 +235,14 @@ class TaskScheduler:
         decision: str,
         task: Dict,
         reason: Optional[str] = None,
+        source: Optional[str] = None,
     ) -> None:
         record = {
             "decision": decision,
             "task_id": task.get("id"),
             "tenant_id": self._tenant_id(task),
             "reason": reason,
+            "source": source,
             "timestamp": time.time(),
         }
         self._audit_records.append(record)
