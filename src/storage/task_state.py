@@ -110,6 +110,56 @@ def postgres_workspace_policy_sql(
     )
 
 
+def assert_task_state_sql_scoped(sql: str) -> bool:
+    if not isinstance(sql, str):
+        raise UnscopedTaskStateAccessError("SQL must be a string")
+
+    normalized = " ".join(sql.lower().split())
+    if "task_state" not in normalized:
+        return True
+
+    statement = normalized.strip()
+    if statement.startswith(("select ", "update ", "delete ")):
+        where_clause = _where_clause(statement)
+        if not _has_workspace_predicate(where_clause):
+            raise UnscopedTaskStateAccessError(
+                "task_state queries must predicate on workspace_id"
+            )
+    elif statement.startswith("insert "):
+        if not _insert_columns_include_workspace(statement):
+            raise UnscopedTaskStateAccessError(
+                "task_state inserts must include workspace_id"
+            )
+
+    return True
+
+
+def _where_clause(statement: str) -> str:
+    match = re.search(r"\bwhere\b(.+)", statement)
+    return match.group(1) if match else ""
+
+
+def _has_workspace_predicate(where_clause: str) -> bool:
+    return (
+        re.search(r"\bworkspace_id\b\s*(=|in\b|is\b)", where_clause)
+        is not None
+    )
+
+
+def _insert_columns_include_workspace(statement: str) -> bool:
+    match = re.search(
+        r"\binsert\s+into\s+task_state\s*\(([^)]+)\)",
+        statement,
+    )
+    if not match:
+        return False
+    columns = {
+        column.strip().strip('"')
+        for column in match.group(1).split(",")
+    }
+    return "workspace_id" in columns
+
+
 def _validate_identifier(identifier: str) -> str:
     if not isinstance(identifier, str):
         raise ValueError("SQL identifier must be a string")

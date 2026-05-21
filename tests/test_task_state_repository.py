@@ -5,6 +5,7 @@ import pytest
 from src.storage import (
     ScopedTaskStateRepository,
     UnscopedTaskStateAccessError,
+    assert_task_state_sql_scoped,
     postgres_workspace_policy_sql,
 )
 
@@ -96,4 +97,37 @@ class TestScopedTaskStateRepository:
         with pytest.raises(ValueError):
             postgres_workspace_policy_sql(
                 table_name="task_state; DROP TABLE tasks",
+            )
+
+    def test_task_state_sql_guard_requires_workspace_predicate(self):
+        assert assert_task_state_sql_scoped(
+            "SELECT * FROM task_state WHERE workspace_id = ? AND task_id = ?"
+        )
+
+        with pytest.raises(UnscopedTaskStateAccessError):
+            assert_task_state_sql_scoped(
+                "SELECT workspace_id, task_id "
+                "FROM task_state WHERE task_id = ?"
+            )
+
+    def test_task_state_sql_guard_blocks_unscoped_writes(self):
+        with pytest.raises(UnscopedTaskStateAccessError):
+            assert_task_state_sql_scoped(
+                "UPDATE task_state SET status = ? WHERE task_id = ?"
+            )
+
+        with pytest.raises(UnscopedTaskStateAccessError):
+            assert_task_state_sql_scoped(
+                "DELETE FROM task_state WHERE task_id = ?"
+            )
+
+    def test_task_state_sql_guard_requires_insert_workspace_column(self):
+        assert assert_task_state_sql_scoped(
+            "INSERT INTO task_state (workspace_id, task_id, status) "
+            "VALUES (?, ?, ?)"
+        )
+
+        with pytest.raises(UnscopedTaskStateAccessError):
+            assert_task_state_sql_scoped(
+                "INSERT INTO task_state (task_id, status) VALUES (?, ?)"
             )
