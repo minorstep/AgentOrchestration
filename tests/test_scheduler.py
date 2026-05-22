@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,75 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_urgent_lane_budget_does_not_block_standard_dispatch(self):
+        scheduler = TaskScheduler(fairness_budgets={"urgent": 1, "standard": 1})
+        scheduler.enqueue({"type": "urgent-a"}, priority=100)
+        scheduler.enqueue({"type": "urgent-b"}, priority=90)
+        scheduler.enqueue({"type": "standard"}, priority=1)
+
+        import asyncio
+        first = asyncio.run(scheduler.dequeue())
+        second = asyncio.run(scheduler.dequeue())
+
+        assert first["type"] == "urgent-a"
+        assert second["type"] == "standard"
+        assert scheduler.metrics_snapshot()["scheduler.deferred.fairness_budget_exhausted"] == 1
+
+    def test_invalid_lifecycle_state_is_rejected_before_dispatch(self):
+        scheduler = TaskScheduler()
+        scheduler.enqueue(
+            {
+                "id": "task-stale",
+                "type": "urgent",
+                "lifecycle_state": "in_flight",
+                "payload": {"private": "not audited"},
+            },
+            priority=100,
+        )
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+
+        assert task is None
+        assert scheduler.metrics_snapshot()["scheduler.rejected.invalid_lifecycle_state"] == 1
+        assert "payload" not in scheduler.audit_log()[-1]
+
+    def test_duplicate_in_flight_transition_is_rejected(self):
+        scheduler = TaskScheduler(fairness_budgets={"urgent": 2})
+        scheduler.enqueue({"id": "task-1", "type": "urgent-a"}, priority=100)
+        scheduler.enqueue({"id": "task-1", "type": "urgent-duplicate"}, priority=90)
+
+        import asyncio
+        first = asyncio.run(scheduler.dequeue())
+        second = asyncio.run(scheduler.dequeue())
+
+        assert first["id"] == "task-1"
+        assert second is None
+        assert scheduler.metrics_snapshot()["scheduler.rejected.duplicate_in_flight"] == 1
+        assert scheduler.audit_log()[-1]["reason"] == "duplicate_in_flight"
+
+    def test_completed_task_cannot_be_dispatched_again(self):
+        scheduler = TaskScheduler(fairness_budgets={"urgent": 2})
+        scheduler.enqueue({"id": "task-1", "type": "urgent-a"}, priority=100)
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+        assert scheduler.complete(task["id"])
+
+        scheduler.enqueue({"id": "task-1", "type": "urgent-duplicate"}, priority=90)
+        duplicate = asyncio.run(scheduler.dequeue())
+
+        assert duplicate is None
+        assert scheduler.metrics_snapshot()["scheduler.rejected.terminal_rewrite"] == 1
+
+    def test_audit_log_is_bounded(self):
+        scheduler = TaskScheduler(audit_limit=3)
+
+        for index in range(5):
+            scheduler.enqueue({"type": f"task-{index}"})
+
+        assert len(scheduler.audit_log()) == 3
 
 # 2019-01-09T19:07:03 update
 
