@@ -1,14 +1,20 @@
 """FastAPI application server."""
 
-import os
 from typing import Dict
 
-from fastapi import FastAPI, Depends
+import os
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
+from .middleware import (
+    AuthMiddleware,
+    LoggingMiddleware,
+    RateLimitMiddleware,
+    RequestContextMiddleware,
+)
 from .routes import router
-from .middleware import AuthMiddleware, RateLimitMiddleware, LoggingMiddleware
 
 
 def create_app(config: Dict = None) -> FastAPI:
@@ -28,11 +34,15 @@ def create_app(config: Dict = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","))
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","),
+    )
 
     app.add_middleware(AuthMiddleware)
     app.add_middleware(RateLimitMiddleware)
     app.add_middleware(LoggingMiddleware)
+    app.add_middleware(RequestContextMiddleware)
 
     app.include_router(router, prefix="/api/v2")
 
