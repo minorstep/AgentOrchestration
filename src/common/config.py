@@ -2,7 +2,67 @@
 
 import os
 import json
+from numbers import Real
 from typing import Any, Dict, Optional
+
+
+RESOURCE_LIMIT_FIELDS = ("cpu_time", "memory_mb", "disk_mb")
+DEFAULT_RESOURCE_LIMITS = {
+    "cpu_time": 60,
+    "memory_mb": 512,
+    "disk_mb": 100,
+}
+
+
+def _coerce_positive_limit(name: str, value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError(
+            f"{name} must be a positive numeric value"
+        )
+
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            raise ValueError(
+                f"{name} must be a positive numeric value"
+            )
+        try:
+            numeric_value = float(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"{name} must be a positive numeric value"
+            ) from exc
+    elif isinstance(value, Real):
+        numeric_value = float(value)
+    else:
+        raise ValueError(
+            f"{name} must be a positive numeric value"
+        )
+
+    if numeric_value <= 0 or not numeric_value.is_integer():
+        raise ValueError(
+            f"{name} must be a positive numeric value"
+        )
+
+    return int(numeric_value)
+
+
+def validate_resource_limits(
+    settings: Optional[Dict[str, Any]] = None,
+) -> Dict[str, int]:
+    """Return positive integer resource limits ready for sandbox use."""
+    if settings is None:
+        settings = {}
+    if not isinstance(settings, dict):
+        raise ValueError("sandbox.resource_limits must be a mapping")
+
+    limits: Dict[str, int] = {}
+    for field in RESOURCE_LIMIT_FIELDS:
+        limits[field] = _coerce_positive_limit(
+            f"sandbox.resource_limits.{field}",
+            settings.get(field, DEFAULT_RESOURCE_LIMITS[field]),
+        )
+    return limits
 
 
 class Config:
@@ -49,6 +109,10 @@ class Config:
 
     def to_dict(self) -> Dict:
         return self._data
+
+    def get_resource_limits(self) -> Dict[str, int]:
+        settings = self.get("sandbox.resource_limits", {})
+        return validate_resource_limits(settings)
 
 # 2019-03-14T15:29:32 update
 

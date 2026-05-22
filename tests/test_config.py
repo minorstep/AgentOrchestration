@@ -1,4 +1,5 @@
 import pytest
+from src.agent.sandbox import ResourceLimits
 from src.common.config import Config
 
 
@@ -31,6 +32,46 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_resource_limits_accept_positive_numeric_config(self):
+        config = Config()
+        config.set("sandbox.resource_limits.cpu_time", "30")
+        config.set("sandbox.resource_limits.memory_mb", 256)
+        config.set("sandbox.resource_limits.disk_mb", 50.0)
+
+        limits = ResourceLimits(**config.get_resource_limits())
+
+        assert limits.cpu_time == 30
+        assert limits.memory_mb == 256
+        assert limits.disk_mb == 50
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("cpu_time", -1),
+            ("memory_mb", 0),
+            ("disk_mb", "not-a-number"),
+        ],
+    )
+    def test_resource_limits_reject_invalid_config_values(self, field, value):
+        config = Config()
+        config.set("sandbox.resource_limits.cpu_time", 30)
+        config.set("sandbox.resource_limits.memory_mb", 256)
+        config.set("sandbox.resource_limits.disk_mb", 50)
+        config.set(f"sandbox.resource_limits.{field}", value)
+
+        with pytest.raises(
+            ValueError,
+            match=f"sandbox.resource_limits.{field}",
+        ):
+            config.get_resource_limits()
+
+    def test_resource_limits_constructor_rejects_negative_values(self):
+        with pytest.raises(
+            ValueError,
+            match="sandbox.resource_limits.memory_mb",
+        ):
+            ResourceLimits(cpu_time=30, memory_mb=-256, disk_mb=50)
 
 # 2019-02-01T18:58:35 update
 
