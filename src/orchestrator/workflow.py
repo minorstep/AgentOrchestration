@@ -1,6 +1,7 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
 from enum import Enum
+import inspect
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
@@ -14,10 +15,21 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        condition: Optional[Callable] = None,
+    ):
+        if condition is not None and not callable(condition):
+            raise TypeError("workflow step condition must be callable")
+
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
+        self.condition = condition
         self.retries = retries
         self.timeout = timeout
         self.status = StepStatus.PENDING
@@ -33,14 +45,22 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.audit_log: List[Dict[str, str]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        if step.condition is not None and not callable(step.condition):
+            raise TypeError("workflow step condition must be callable")
         self.steps.append(step)
         self._step_map[step.id] = step
         return self
 
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
+
+    def record_audit(self, record: Dict[str, str]) -> None:
+        self.audit_log.append(record)
+        if len(self.audit_log) > 100:
+            del self.audit_log[:-100]
 
 
 class WorkflowManager:
@@ -68,6 +88,12 @@ class WorkflowManager:
 
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
+            should_run = self._evaluate_step_condition(workflow, step)
+            if should_run is None:
+                return False
+            if not should_run:
+                continue
+
             step.status = StepStatus.RUNNING
             try:
                 result = step.handler()
@@ -81,6 +107,145 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _evaluate_step_condition(self, workflow: Workflow, step: WorkflowStep) -> Optional[bool]:
+        if step.condition is None:
+            return True
+
+        snapshot = self._capture_workflow_state(workflow)
+        try:
+            result = self._call_condition(step.condition, workflow, step)
+        except Exception:
+            self._restore_workflow_state(workflow, snapshot)
+            self._reject_step_condition(workflow, step, "condition_error")
+            return None
+
+        mutated = self._workflow_state_changed(workflow, snapshot)
+        self._restore_workflow_state(workflow, snapshot)
+        if mutated:
+            self._reject_step_condition(workflow, step, "condition_side_effect")
+            return None
+
+        if not isinstance(result, bool):
+            self._reject_step_condition(workflow, step, "condition_non_boolean")
+            return None
+
+        if not result:
+            step.status = StepStatus.SKIPPED
+            self._record_workflow_decision(workflow, step, "skipped", "condition_false")
+            return False
+
+        self._record_workflow_decision(workflow, step, "accepted", "condition_true")
+        return True
+
+    def _call_condition(self, condition: Callable, workflow: Workflow, step: WorkflowStep) -> Any:
+        try:
+            signature = inspect.signature(condition)
+        except (TypeError, ValueError):
+            return condition(workflow, step)
+
+        positional = [
+            parameter
+            for parameter in signature.parameters.values()
+            if parameter.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+        accepts_args = any(
+            parameter.kind == inspect.Parameter.VAR_POSITIONAL
+            for parameter in signature.parameters.values()
+        )
+        if accepts_args or len(positional) >= 2:
+            return condition(workflow, step)
+        if len(positional) == 1:
+            return condition(workflow)
+        return condition()
+
+    def _reject_step_condition(self, workflow: Workflow, step: WorkflowStep, reason: str) -> None:
+        step.status = StepStatus.FAILED
+        step.error = "workflow condition rejected"
+        workflow.status = StepStatus.FAILED
+        self._record_workflow_decision(workflow, step, "rejected", reason)
+
+    def _record_workflow_decision(
+        self,
+        workflow: Workflow,
+        step: WorkflowStep,
+        decision: str,
+        reason: str,
+    ) -> None:
+        workflow.record_audit({
+            "event": "workflow_condition_evaluation",
+            "workflow_id": workflow.id,
+            "step_id": step.id,
+            "decision": decision,
+            "reason": reason,
+        })
+
+    def _capture_workflow_state(self, workflow: Workflow) -> Dict[str, Any]:
+        return {
+            "workflow_status": workflow.status,
+            "steps": list(workflow.steps),
+            "step_map": dict(workflow._step_map),
+            "audit_log": list(workflow.audit_log),
+            "step_state": {
+                step.id: {
+                    "name": step.name,
+                    "handler": step.handler,
+                    "condition": step.condition,
+                    "retries": step.retries,
+                    "timeout": step.timeout,
+                    "status": step.status,
+                    "result": step.result,
+                    "error": step.error,
+                }
+                for step in workflow.steps
+            },
+        }
+
+    def _workflow_state_changed(self, workflow: Workflow, snapshot: Dict[str, Any]) -> bool:
+        if workflow.status is not snapshot["workflow_status"]:
+            return True
+        if workflow.steps != snapshot["steps"]:
+            return True
+        if workflow._step_map != snapshot["step_map"]:
+            return True
+        if workflow.audit_log != snapshot["audit_log"]:
+            return True
+
+        for step in workflow.steps:
+            state = snapshot["step_state"].get(step.id)
+            if state is None:
+                return True
+            if (
+                step.name != state["name"]
+                or step.handler != state["handler"]
+                or step.condition != state["condition"]
+                or step.retries != state["retries"]
+                or step.timeout != state["timeout"]
+                or step.status is not state["status"]
+                or step.result != state["result"]
+                or step.error != state["error"]
+            ):
+                return True
+        return False
+
+    def _restore_workflow_state(self, workflow: Workflow, snapshot: Dict[str, Any]) -> None:
+        workflow.status = snapshot["workflow_status"]
+        workflow.steps = list(snapshot["steps"])
+        workflow._step_map = dict(snapshot["step_map"])
+        workflow.audit_log = list(snapshot["audit_log"])
+        for step in workflow.steps:
+            state = snapshot["step_state"][step.id]
+            step.name = state["name"]
+            step.handler = state["handler"]
+            step.condition = state["condition"]
+            step.retries = state["retries"]
+            step.timeout = state["timeout"]
+            step.status = state["status"]
+            step.result = state["result"]
+            step.error = state["error"]
 
 # 2019-03-27T19:58:07 update
 
