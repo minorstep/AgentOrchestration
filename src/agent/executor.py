@@ -5,15 +5,27 @@ import time
 from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
 
+from src.common.exception_tracking import ExceptionTracker
+
 
 class AgentExecutor:
-    def __init__(self, max_concurrent: int = 5):
+    def __init__(
+        self,
+        max_concurrent: int = 5,
+        exception_tracker: Optional[ExceptionTracker] = None,
+    ):
         self.max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
+        self.exception_tracker = exception_tracker or ExceptionTracker()
 
-    async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
+    async def execute(
+        self,
+        agent_id: str,
+        task: Dict[str, Any],
+        handler: Callable,
+    ) -> str:
         execution_id = str(uuid4())
         async with self._semaphore:
             task_obj = asyncio.create_task(
@@ -24,12 +36,28 @@ class AgentExecutor:
                 result = await task_obj
                 self._results[execution_id] = result
             except Exception as e:
-                self._results[execution_id] = {"error": str(e)}
+                self._results[execution_id] = {
+                    "error": self.exception_tracker.capture(
+                        e,
+                        task=task,
+                        task_id=task.get("id"),
+                        context={
+                            "execution_id": execution_id,
+                            "agent_id": agent_id,
+                        },
+                    )
+                }
             finally:
                 self._active_tasks.pop(execution_id, None)
         return execution_id
 
-    async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
+    async def _run_execution(
+        self,
+        exec_id: str,
+        agent_id: str,
+        task: Dict,
+        handler: Callable,
+    ) -> Any:
         start = time.time()
         result = await handler(agent_id, task)
         duration = time.time() - start
@@ -56,7 +84,10 @@ class AgentExecutor:
         for task in self._active_tasks.values():
             task.cancel()
         if self._active_tasks:
-            await asyncio.gather(*self._active_tasks.values(), return_exceptions=True)
+            await asyncio.gather(
+                *self._active_tasks.values(),
+                return_exceptions=True,
+            )
 
 # 2019-01-31T14:19:34 update
 
