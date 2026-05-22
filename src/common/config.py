@@ -2,6 +2,7 @@
 
 import os
 import json
+from copy import deepcopy
 from typing import Any, Dict, Optional
 
 
@@ -14,7 +15,7 @@ class Config:
 
     def load(self, path: str) -> None:
         with open(path) as f:
-            self._data = json.load(f)
+            self._data = self._copy_value(json.load(f))
 
     def _load_env_overrides(self) -> None:
         prefix = "AO_"
@@ -30,7 +31,10 @@ class Config:
             if part not in current:
                 current[part] = {}
             current = current[part]
-        current[parts[-1]] = value
+        current[parts[-1]] = self._copy_value(value)
+
+    def _copy_value(self, value: Any) -> Any:
+        return deepcopy(value)
 
     def get(self, key: str, default: Any = None) -> Any:
         parts = key.split(".")
@@ -42,13 +46,13 @@ class Config:
                     return default
             else:
                 return default
-        return current
+        return self._copy_value(current)
 
     def set(self, key: str, value: Any) -> None:
         self._set_nested(key, value)
 
     def to_dict(self) -> Dict:
-        return self._data
+        return self._copy_value(self._data)
 
 # 2019-03-14T15:29:32 update
 

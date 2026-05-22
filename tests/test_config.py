@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,28 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_set_copies_nested_values_from_callers(self):
+        config = Config()
+        caller_owned = {"primary": {"host": "db-1"}, "replicas": ["db-2"]}
+
+        config.set("database", caller_owned)
+        caller_owned["primary"]["host"] = "db-mutated"
+        caller_owned["replicas"].append("db-3")
+
+        assert config.get("database.primary.host") == "db-1"
+        assert config.get("database.replicas") == ["db-2"]
+
+    def test_get_and_to_dict_return_copies(self):
+        config = Config()
+        config.set("database", {"primary": {"host": "db-1"}})
+
+        returned_value = config.get("database")
+        returned_value["primary"]["host"] = "db-mutated"
+        returned_dict = config.to_dict()
+        returned_dict["database"]["primary"]["host"] = "dict-mutated"
+
+        assert config.get("database.primary.host") == "db-1"
 
 # 2019-02-01T18:58:35 update
 
