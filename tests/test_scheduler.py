@@ -1,5 +1,19 @@
+import asyncio
+
 import pytest
-from src.orchestrator.scheduler import TaskScheduler
+from src.common.metrics import MetricsCollector
+from src.orchestrator.scheduler import (
+    QueueCapacityError,
+    TaskScheduler,
+)
+
+
+class FailingQueue:
+    def push(self, item, priority=0):
+        raise RuntimeError("storage transaction failed")
+
+    def __len__(self):
+        return 0
 
 
 class TestTaskScheduler:
@@ -12,7 +26,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +33,81 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_capacity_exhaustion_rejects_without_task_mutation(self):
+        metrics = MetricsCollector()
+        scheduler = TaskScheduler(
+            queue_capacity={"default": 1},
+            metrics_collector=metrics,
+        )
+        scheduler.enqueue({"type": "existing"})
+        task = {"type": "overflow", "payload": {"secret": "hidden"}}
+
+        with pytest.raises(QueueCapacityError):
+            scheduler.enqueue(task)
+
+        assert task == {"type": "overflow", "payload": {"secret": "hidden"}}
+        assert scheduler.queue_capacity_state()["used"] == 1
+        audit = scheduler.capacity_audit_records()
+        assert audit[-1]["decision"] == "capacity_exhausted"
+        assert "secret" not in repr(audit)
+
+    def test_enqueue_rollback_releases_capacity_and_restores_task(self):
+        metrics = MetricsCollector()
+        scheduler = TaskScheduler(
+            queue_capacity={"default": 1},
+            metrics_collector=metrics,
+        )
+        scheduler._queues["default"] = FailingQueue()
+        task = {"type": "test", "payload": {"secret": "hidden"}}
+
+        with pytest.raises(RuntimeError):
+            scheduler.enqueue(task)
+
+        assert task == {"type": "test", "payload": {"secret": "hidden"}}
+        assert scheduler.queue_capacity_state()["used"] == 0
+        audit = scheduler.capacity_audit_records()
+        assert audit[-1]["decision"] == "enqueue_rollback"
+        assert "secret" not in repr(audit)
+        counters = metrics.snapshot()["counters"]
+        assert counters["scheduler.queue_capacity.enqueue_rollback"] == 1
+
+    def test_retry_enqueue_rollback_preserves_in_flight_task(self):
+        metrics = MetricsCollector()
+        scheduler = TaskScheduler(
+            queue_capacity={"default": 1},
+            metrics_collector=metrics,
+        )
+        scheduler.enqueue({"type": "retry"})
+        task = asyncio.run(scheduler.dequeue())
+        scheduler._queues["default"] = FailingQueue()
+
+        with pytest.raises(RuntimeError):
+            scheduler.fail(task["id"])
+
+        assert task["id"] in scheduler._in_flight
+        assert scheduler._in_flight[task["id"]]["retries"] == 1
+        assert scheduler.queue_capacity_state()["used"] == 0
+        audit = scheduler.capacity_audit_records()
+        assert audit[-1]["decision"] == "retry_enqueue_rollback"
+        assert (
+            metrics.snapshot()["counters"][
+                "scheduler.queue_capacity.retry_enqueue_rollback"
+            ]
+            == 1
+        )
 
 # 2019-01-09T19:07:03 update
 

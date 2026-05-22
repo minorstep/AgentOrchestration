@@ -1,10 +1,19 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
+import logging
 import time
-from typing import Any, Dict, Optional
+from collections import defaultdict
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
+
+from src.common.metrics import metrics
+
+logger = logging.getLogger(__name__)
+
+
+class QueueCapacityError(RuntimeError):
+    """Raised when a queue cannot accept another task."""
 
 
 class PriorityQueue:
@@ -31,30 +40,74 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        queue_capacity: Optional[Dict[str, int]] = None,
+        metrics_collector=None,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._queue_capacity = dict(queue_capacity or {})
+        self._queue_usage: Dict[str, int] = defaultdict(int)
+        self._capacity_audit: List[Dict[str, Any]] = []
+        self.metrics = metrics_collector or metrics
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        reserved = self._reserve_capacity(queue)
+        original = dict(task)
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task["retries"] = task.get("retries", 0)
 
-        if queue not in self._queues:
-            self._queues[queue] = PriorityQueue()
-        self._queues[queue].push(task, priority)
+        try:
+            if queue not in self._queues:
+                self._queues[queue] = PriorityQueue()
+            self._queues[queue].push(task, priority)
+        except Exception:
+            if reserved:
+                self._release_capacity(
+                    queue,
+                    "enqueue_rollback",
+                    task_id,
+                )
+            else:
+                self._record_capacity_decision(
+                    queue,
+                    "enqueue_rollback",
+                    task_id,
+                )
+            task.clear()
+            task.update(original)
+            raise
+
+        self._record_capacity_decision(queue, "enqueued", task_id)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -65,6 +118,7 @@ class TaskScheduler:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                self._release_capacity(queue, "dequeued", task["id"])
                 self._in_flight[task["id"]] = task
                 return task
         return None
@@ -77,9 +131,76 @@ class TaskScheduler:
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                try:
+                    self.enqueue(task, queue, priority=task.get("priority", 0))
+                except Exception:
+                    self._in_flight[task_id] = task
+                    self._record_capacity_decision(
+                        queue,
+                        "retry_enqueue_rollback",
+                        task_id,
+                    )
+                    raise
                 return True
         return False
+
+    def queue_capacity_state(
+        self,
+        queue: str = "default",
+    ) -> Dict[str, Optional[int]]:
+        capacity = self._queue_capacity.get(queue)
+        used = self._queue_usage.get(queue, 0)
+        return {
+            "queue": queue,
+            "capacity": capacity,
+            "used": used,
+            "available": None if capacity is None else capacity - used,
+        }
+
+    def capacity_audit_records(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self._capacity_audit]
+
+    def _reserve_capacity(self, queue: str) -> bool:
+        capacity = self._queue_capacity.get(queue)
+        if capacity is None:
+            return False
+        if self._queue_usage[queue] >= capacity:
+            self._record_capacity_decision(queue, "capacity_exhausted")
+            raise QueueCapacityError(f"queue {queue} is at capacity")
+        self._queue_usage[queue] += 1
+        return True
+
+    def _release_capacity(
+        self,
+        queue: str,
+        decision: str,
+        task_id: Optional[str] = None,
+    ) -> None:
+        if queue not in self._queue_capacity:
+            return
+        if self._queue_usage[queue] > 0:
+            self._queue_usage[queue] -= 1
+        self._record_capacity_decision(queue, decision, task_id)
+
+    def _record_capacity_decision(
+        self,
+        queue: str,
+        decision: str,
+        task_id: Optional[str] = None,
+    ) -> None:
+        if queue not in self._queue_capacity:
+            return
+        record = {
+            "queue": queue,
+            "decision": decision,
+            "used": self._queue_usage.get(queue, 0),
+            "capacity": self._queue_capacity.get(queue),
+        }
+        if task_id:
+            record["task_ref"] = task_id[:12]
+        self._capacity_audit.append(record)
+        self.metrics.increment(f"scheduler.queue_capacity.{decision}")
+        logger.info("queue capacity decision", extra={"decision": record})
 
 # 2019-04-25T08:37:12 update
 
