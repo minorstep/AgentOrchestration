@@ -7,16 +7,51 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+from src.common.auth import AuthError, auth_service
+
 logger = logging.getLogger(__name__)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
-                return Response(status_code=401, content="Unauthorized")
+    def __init__(self, app, service=None):
+        super().__init__(app)
+        self.service = service or auth_service
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        path = request.url.path
+        if path.startswith("/api/v2") and path != "/api/v2/auth/token":
+            workspace_id = self._task_monitor_workspace(path)
+            if workspace_id:
+                try:
+                    request.state.auth_service = self.service
+                    request.state.auth_context = self.service.validate_request(
+                        headers=request.headers,
+                        cookies=request.cookies,
+                        workspace_id=workspace_id,
+                        path=path,
+                    )
+                except AuthError as exc:
+                    return Response(
+                        status_code=exc.status_code,
+                        content=exc.public_message,
+                    )
+            else:
+                token = request.headers.get("Authorization", "")
+                if not token.startswith("Bearer ") or not token[7:].strip():
+                    return Response(status_code=401, content="Unauthorized")
         return await call_next(request)
+
+    @staticmethod
+    def _task_monitor_workspace(path: str):
+        parts = path.strip("/").split("/")
+        if len(parts) >= 6 and parts[:3] == ["api", "v2", "workspaces"]:
+            if parts[4] == "task-monitor":
+                return parts[3]
+        return None
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -26,14 +61,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +84,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update

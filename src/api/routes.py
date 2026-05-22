@@ -1,22 +1,55 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException, Request
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.auth import AuthError, auth_service
 
 router = APIRouter()
 registry = AgentRegistry()
 
 
+@router.get("/workspaces/{workspace_id}/task-monitor/poll")
+async def poll_task_monitor(workspace_id: str, request: Request):
+    context = getattr(request.state, "auth_context", None)
+    if context is None:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    service = getattr(request.state, "auth_service", auth_service)
+    try:
+        context = service.revalidate_task_monitor_poll(
+            context,
+            workspace_id,
+        )
+    except AuthError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.public_message,
+        )
+    return {
+        "status": "ok",
+        "workspace_id": workspace_id,
+        "principal": context.subject,
+        "client_type": context.client_type,
+        "events": [],
+    }
+
+
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
