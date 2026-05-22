@@ -1,23 +1,58 @@
 """Orchestration Engine — Core execution and coordination logic."""
 
 import asyncio
+import hashlib
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.metrics import metrics
 from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
 
 
+_ALLOWED_EVENT_TRANSITIONS = {
+    "run.started": "running",
+    "run.completed": "completed",
+    "run.failed": "failed",
+    "task.started": "running",
+    "task.completed": "completed",
+    "task.failed": "failed",
+    "handler.started": "running",
+    "handler.completed": "completed",
+    "handler.failed": "failed",
+}
+
+_TERMINAL_LIFECYCLES = {"completed", "failed", "cancelled", "terminated"}
+_LIFECYCLE_ORDER = {
+    "pending": 0,
+    "running": 1,
+    "completed": 2,
+    "failed": 2,
+    "cancelled": 2,
+    "terminated": 2,
+}
+
+
 class OrchestrationEngine:
-    def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
+    def __init__(
+        self,
+        max_workers: int = 10,
+        agent_timeout: int = 300,
+        metrics_collector=None,
+    ):
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
+        self.metrics = metrics_collector or metrics
         self._running = False
+        self._event_state: Dict[str, Dict[str, Any]] = {}
+        self._event_audit: List[Dict[str, Any]] = []
+        self._quarantined_events: List[Dict[str, Any]] = []
         self._hooks: Dict[str, List[Callable]] = {
             "pre_execute": [],
             "post_execute": [],
@@ -28,6 +63,141 @@ class OrchestrationEngine:
     def register_hook(self, event: str, callback: Callable) -> None:
         if event in self._hooks:
             self._hooks[event].append(callback)
+
+    def dispatch_event(self, event: Dict[str, Any]) -> bool:
+        """Apply an orchestrator lifecycle event after version checks."""
+        decision = self._validate_event(event)
+        if not decision["accepted"]:
+            self._quarantine_event(event, decision["reason"])
+            return False
+
+        entity_id = str(event["entity_id"])
+        state = {
+            "lifecycle": str(event["lifecycle"]),
+            "revision": int(event["revision"]),
+            "attempt": int(event["attempt"]),
+            "event_type": str(event["type"]),
+            "updated_at": time.time(),
+        }
+        self._event_state[entity_id] = state
+        self.metrics.increment("orchestrator.events.accepted")
+        self._record_event_decision(event, "accepted")
+        logger.info(
+            "orchestrator event accepted",
+            extra=self._safe_event_log_context(event, "accepted"),
+        )
+        return True
+
+    def get_event_state(self, entity_id: str) -> Optional[Dict[str, Any]]:
+        state = self._event_state.get(entity_id)
+        return dict(state) if state else None
+
+    def event_audit_records(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self._event_audit]
+
+    def quarantined_events(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self._quarantined_events]
+
+    def _validate_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        event_type = event.get("type")
+        if event_type not in _ALLOWED_EVENT_TRANSITIONS:
+            return {"accepted": False, "reason": "unknown_event_type"}
+
+        entity_id = event.get("entity_id")
+        if not entity_id:
+            return {"accepted": False, "reason": "missing_entity_id"}
+
+        try:
+            revision = int(event["revision"])
+            attempt = int(event["attempt"])
+        except (KeyError, TypeError, ValueError):
+            return {"accepted": False, "reason": "invalid_version_marker"}
+
+        if revision < 0 or attempt < 0:
+            return {"accepted": False, "reason": "invalid_version_marker"}
+
+        lifecycle = str(event.get("lifecycle", ""))
+        if lifecycle != _ALLOWED_EVENT_TRANSITIONS[event_type]:
+            return {"accepted": False, "reason": "policy_lifecycle_mismatch"}
+
+        current = self._event_state.get(str(entity_id))
+        if not current:
+            return {"accepted": True, "reason": "accepted"}
+
+        if revision < current["revision"]:
+            return {"accepted": False, "reason": "stale_revision"}
+        if revision == current["revision"] and attempt < current["attempt"]:
+            return {"accepted": False, "reason": "stale_attempt"}
+        if (
+            revision == current["revision"]
+            and attempt == current["attempt"]
+            and lifecycle == current["lifecycle"]
+        ):
+            return {"accepted": False, "reason": "duplicate_transition"}
+        if (
+            current["lifecycle"] in _TERMINAL_LIFECYCLES
+            and lifecycle != current["lifecycle"]
+        ):
+            return {"accepted": False, "reason": "terminal_lifecycle"}
+        current_order = _LIFECYCLE_ORDER[current["lifecycle"]]
+        if _LIFECYCLE_ORDER[lifecycle] < current_order:
+            return {"accepted": False, "reason": "lifecycle_regression"}
+
+        return {"accepted": True, "reason": "accepted"}
+
+    def _quarantine_event(self, event: Dict[str, Any], reason: str) -> None:
+        record = self._record_event_decision(event, reason)
+        self._quarantined_events.append(record)
+        self.metrics.increment("orchestrator.events.quarantined")
+        self.metrics.increment(f"orchestrator.events.quarantined.{reason}")
+        logger.warning(
+            "orchestrator event quarantined",
+            extra=self._safe_event_log_context(event, reason),
+        )
+
+    def _record_event_decision(
+        self,
+        event: Dict[str, Any],
+        decision: str,
+    ) -> Dict[str, Any]:
+        entity_id = str(event.get("entity_id", ""))
+        current = self._event_state.get(entity_id)
+        record = {
+            "decision": decision,
+            "event_type": str(event.get("type", "unknown")),
+            "entity_ref": self._event_ref(entity_id),
+            "revision": self._safe_int(event.get("revision")),
+            "attempt": self._safe_int(event.get("attempt")),
+            "requested_lifecycle": str(event.get("lifecycle", "unknown")),
+            "current_lifecycle": current["lifecycle"] if current else None,
+        }
+        self._event_audit.append(record)
+        return record
+
+    def _safe_event_log_context(
+        self,
+        event: Dict[str, Any],
+        decision: str,
+    ) -> Dict[str, Any]:
+        entity_id = str(event.get("entity_id", ""))
+        return {
+            "event_decision": decision,
+            "event_type": str(event.get("type", "unknown")),
+            "entity_ref": self._event_ref(entity_id),
+            "revision": self._safe_int(event.get("revision")),
+            "attempt": self._safe_int(event.get("attempt")),
+        }
+
+    def _event_ref(self, entity_id: str) -> str:
+        if not entity_id:
+            return "missing"
+        return hashlib.sha256(entity_id.encode("utf-8")).hexdigest()[:12]
+
+    def _safe_int(self, value: Any) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     async def start(self) -> None:
         self._running = True
@@ -82,7 +252,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 
