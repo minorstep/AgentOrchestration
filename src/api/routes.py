@@ -1,28 +1,51 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from .public_validation import (
+    validate_agent_filters,
+    validate_agent_id,
+    validate_agent_registration,
+)
 
 router = APIRouter()
 registry = AgentRegistry()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
-    status_filter = AgentStatus(status) if status else None
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
+    status_filter, group = validate_agent_filters(status, group)
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: Optional[str] = None,
+    agent_type: Optional[str] = None,
+    config: Optional[Dict] = None,
+):
+    name, agent_type, config = validate_agent_registration(
+        name,
+        agent_type,
+        config,
+    )
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
 
+@router.get("/agents/count")
+async def agent_count():
+    return {"count": registry.count()}
+
+
 @router.get("/agents/{agent_id}")
 async def get_agent(agent_id: str):
+    agent_id = validate_agent_id(agent_id)
     agent = registry.get(agent_id)
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -31,6 +54,7 @@ async def get_agent(agent_id: str):
 
 @router.delete("/agents/{agent_id}")
 async def delete_agent(agent_id: str):
+    agent_id = validate_agent_id(agent_id)
     if not registry.delete(agent_id):
         raise HTTPException(status_code=404, detail="Agent not found")
     return {"status": "deleted"}
@@ -38,6 +62,7 @@ async def delete_agent(agent_id: str):
 
 @router.post("/agents/{agent_id}/start")
 async def start_agent(agent_id: str):
+    agent_id = validate_agent_id(agent_id)
     if not registry.update_status(agent_id, AgentStatus.RUNNING):
         raise HTTPException(status_code=404, detail="Agent not found")
     return {"status": "started"}
@@ -45,14 +70,10 @@ async def start_agent(agent_id: str):
 
 @router.post("/agents/{agent_id}/stop")
 async def stop_agent(agent_id: str):
+    agent_id = validate_agent_id(agent_id)
     if not registry.update_status(agent_id, AgentStatus.PAUSED):
         raise HTTPException(status_code=404, detail="Agent not found")
     return {"status": "stopped"}
-
-
-@router.get("/agents/count")
-async def agent_count():
-    return {"count": registry.count()}
 
 # 2019-03-18T11:10:18 update
 
