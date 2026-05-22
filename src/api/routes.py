@@ -1,7 +1,7 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException, Request
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
 
@@ -10,13 +10,25 @@ registry = AgentRegistry()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
-    return {"agents": registry.list(status=status_filter, group=group)}
+    return {
+        "agents": registry.list(
+            status=status_filter,
+            group=group,
+        )
+    }
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -34,6 +46,24 @@ async def delete_agent(agent_id: str):
     if not registry.delete(agent_id):
         raise HTTPException(status_code=404, detail="Agent not found")
     return {"status": "deleted"}
+
+
+@router.post("/saved-views/{view_id}/share")
+async def share_saved_view(
+    request: Request,
+    view_id: str,
+    target_user_id: str,
+):
+    principal = getattr(request.state, "principal", None)
+    if principal is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return {
+        "status": "shared",
+        "view_id": view_id,
+        "workspace_id": principal.workspace_id,
+        "shared_by": principal.user_id,
+        "target_user_id": target_user_id,
+    }
 
 
 @router.post("/agents/{agent_id}/start")
