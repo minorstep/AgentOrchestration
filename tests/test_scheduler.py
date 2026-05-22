@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,35 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_manual_run_waits_for_concurrency_budget(self):
+        scheduler = TaskScheduler(max_concurrent=1)
+        scheduler.enqueue({"type": "scheduled"}, queue="agents")
+
+        import asyncio
+        first = asyncio.run(scheduler.dequeue(queue="agents"))
+        manual_task = {"type": "manual", "state": "queued"}
+        manual_id = scheduler.trigger_manual(
+            manual_task,
+            queue="agents",
+            priority=10,
+        )
+
+        assert asyncio.run(scheduler.dequeue(queue="agents")) is None
+        assert manual_task["state"] == "queued"
+        assert scheduler.audit_log()[-1] == {
+            "task_id": manual_id,
+            "queue": "agents",
+            "source": "manual",
+            "accepted": False,
+            "reason": "concurrency_budget_exhausted",
+            "timestamp": scheduler.audit_log()[-1]["timestamp"],
+        }
+
+        assert scheduler.complete(first["id"])
+        second = asyncio.run(scheduler.dequeue(queue="agents"))
+        assert second["id"] == manual_id
+        assert second["type"] == "manual"
 
 # 2019-01-09T19:07:03 update
 
