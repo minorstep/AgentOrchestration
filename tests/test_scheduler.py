@@ -4,6 +4,7 @@ import pytest
 from src.common.metrics import MetricsCollector
 from src.orchestrator.scheduler import (
     QueueCapacityError,
+    PriorityQueue,
     TaskScheduler,
 )
 
@@ -108,6 +109,45 @@ class TestTaskScheduler:
             ]
             == 1
         )
+
+    def test_enqueue_transaction_id_is_idempotent(self):
+        scheduler = TaskScheduler(queue_capacity={"default": 2})
+        first_task = {"type": "first"}
+        duplicate_task = {"type": "duplicate"}
+
+        first = scheduler.enqueue(
+            first_task,
+            transaction_id="tx-once",
+        )
+        second = scheduler.enqueue(
+            duplicate_task,
+            transaction_id="tx-once",
+        )
+
+        assert second == first
+        assert "id" not in duplicate_task
+        assert scheduler.queue_capacity_state()["used"] == 1
+        task = asyncio.run(scheduler.dequeue())
+        assert task["type"] == "first"
+        assert scheduler.queue_capacity_state()["used"] == 0
+
+    def test_failed_transaction_id_can_retry_after_rollback(self):
+        scheduler = TaskScheduler(queue_capacity={"default": 1})
+        scheduler._queues["default"] = FailingQueue()
+
+        with pytest.raises(RuntimeError):
+            scheduler.enqueue({"type": "first"}, transaction_id="tx-retry")
+
+        assert scheduler.queue_capacity_state()["used"] == 0
+
+        scheduler._queues["default"] = PriorityQueue()
+        task_id = scheduler.enqueue(
+            {"type": "first"},
+            transaction_id="tx-retry",
+        )
+
+        assert task_id is not None
+        assert scheduler.queue_capacity_state()["used"] == 1
 
 # 2019-01-09T19:07:03 update
 

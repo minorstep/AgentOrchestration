@@ -48,6 +48,7 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._enqueue_transactions: Dict[str, str] = {}
         self._queue_capacity = dict(queue_capacity or {})
         self._queue_usage: Dict[str, int] = defaultdict(int)
         self._capacity_audit: List[Dict[str, Any]] = []
@@ -59,7 +60,11 @@ class TaskScheduler:
         task: Dict,
         queue: str = "default",
         priority: int = 0,
+        transaction_id: Optional[str] = None,
     ) -> str:
+        if transaction_id and transaction_id in self._enqueue_transactions:
+            return self._enqueue_transactions[transaction_id]
+
         reserved = self._reserve_capacity(queue)
         original = dict(task)
         task_id = str(uuid4())
@@ -89,6 +94,8 @@ class TaskScheduler:
             raise
 
         self._record_capacity_decision(queue, "enqueued", task_id)
+        if transaction_id:
+            self._enqueue_transactions[transaction_id] = task_id
         return task_id
 
     def schedule(
