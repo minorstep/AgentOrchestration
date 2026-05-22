@@ -3,9 +3,10 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.metrics import metrics
 from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
@@ -18,6 +19,8 @@ class OrchestrationEngine:
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
         self._running = False
+        self._event_state: Dict[str, Dict[str, Any]] = {}
+        self._event_audit: List[Dict[str, Any]] = []
         self._hooks: Dict[str, List[Callable]] = {
             "pre_execute": [],
             "post_execute": [],
@@ -28,6 +31,115 @@ class OrchestrationEngine:
     def register_hook(self, event: str, callback: Callable) -> None:
         if event in self._hooks:
             self._hooks[event].append(callback)
+
+    def ingest_event(self, event: Dict[str, Any]) -> bool:
+        """Validate shared-bus events before mutating lifecycle state."""
+        entity_id, tenant_id = self._event_identity(event)
+        current = self._event_state.get(entity_id)
+        revision = int(event.get("revision", 0))
+        attempt = int(event.get("attempt", 0))
+        next_state = event.get("state")
+
+        accepted, reason = self._validate_event_transition(
+            current,
+            tenant_id,
+            revision,
+            attempt,
+            next_state,
+        )
+        self._record_event_decision(
+            event,
+            entity_id,
+            tenant_id,
+            accepted,
+            reason,
+        )
+        if not accepted:
+            metrics.increment("orchestrator.event_intake.rejected")
+            logger.info(
+                "event intake rejected entity=%s reason=%s",
+                entity_id,
+                reason,
+            )
+            return False
+
+        self._event_state[entity_id] = {
+            "tenant_id": tenant_id,
+            "revision": revision,
+            "attempt": attempt,
+            "state": next_state,
+        }
+        metrics.increment("orchestrator.event_intake.accepted")
+        return True
+
+    def event_state(self, entity_id: str) -> Optional[Dict[str, Any]]:
+        state = self._event_state.get(entity_id)
+        return dict(state) if state else None
+
+    def event_audit(self) -> List[Dict[str, Any]]:
+        return [dict(item) for item in self._event_audit]
+
+    def _event_identity(self, event: Dict[str, Any]) -> Tuple[str, str]:
+        entity_id = (
+            event.get("run_id")
+            or event.get("task_id")
+            or event.get("id")
+        )
+        tenant_id = event.get("tenant_id")
+        if not entity_id or not tenant_id:
+            raise ValueError("event requires tenant_id and run_id/task_id/id")
+        return str(entity_id), str(tenant_id)
+
+    def _validate_event_transition(
+        self,
+        current: Optional[Dict[str, Any]],
+        tenant_id: str,
+        revision: int,
+        attempt: int,
+        next_state: str,
+    ) -> Tuple[bool, str]:
+        if current is None:
+            return True, "accepted"
+        if current["tenant_id"] != tenant_id:
+            return False, "tenant_mismatch"
+        if revision <= current["revision"]:
+            return False, "stale_revision"
+        if attempt < current["attempt"]:
+            return False, "stale_attempt"
+        if not self._is_valid_lifecycle(current["state"], next_state):
+            return False, "invalid_lifecycle"
+        return True, "accepted"
+
+    def _is_valid_lifecycle(self, current: str, next_state: str) -> bool:
+        terminal = {"completed", "failed", "cancelled"}
+        if current in terminal:
+            return False
+        allowed = {
+            "queued": {"running", "cancelled"},
+            "running": {"completed", "failed", "cancelled"},
+            "retrying": {"running", "failed", "cancelled"},
+        }
+        return next_state in allowed.get(current, set())
+
+    def _record_event_decision(
+        self,
+        event: Dict[str, Any],
+        entity_id: str,
+        tenant_id: str,
+        accepted: bool,
+        reason: str,
+    ) -> None:
+        self._event_audit.append(
+            {
+                "entity_id": entity_id,
+                "tenant_id": tenant_id,
+                "event_type": event.get("type"),
+                "accepted": accepted,
+                "reason": reason,
+                "revision": int(event.get("revision", 0)),
+                "attempt": int(event.get("attempt", 0)),
+            }
+        )
 
     async def start(self) -> None:
         self._running = True
@@ -82,7 +194,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 
