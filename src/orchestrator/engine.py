@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
@@ -10,14 +11,28 @@ from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MAX_DELEGATION_DEPTH = 5
+
 
 class OrchestrationEngine:
-    def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
+    def __init__(
+        self,
+        max_workers: int = 10,
+        agent_timeout: int = 300,
+        max_delegation_depth: int = DEFAULT_MAX_DELEGATION_DEPTH,
+    ):
+        if isinstance(max_delegation_depth, bool) or max_delegation_depth < 0:
+            raise ValueError(
+                "max_delegation_depth must be a non-negative integer"
+            )
+
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
+        self.max_delegation_depth = max_delegation_depth
         self._running = False
+        self._terminal_outcomes: Dict[str, Dict[str, Any]] = {}
         self._hooks: Dict[str, List[Callable]] = {
             "pre_execute": [],
             "post_execute": [],
@@ -45,6 +60,23 @@ class OrchestrationEngine:
     async def _execute_task(self, task: Dict[str, Any]) -> None:
         task_id = task["id"]
         agent_id = task["target_agent"]
+
+        delegation_depth = self._delegation_depth(task)
+        if delegation_depth > self.max_delegation_depth:
+            self._record_terminal_outcome(
+                task,
+                "delegation_depth_exceeded",
+                delegation_depth,
+            )
+            logger.warning(
+                "Rejected task %s before execution: "
+                "delegation depth %s exceeds %s",
+                task_id,
+                delegation_depth,
+                self.max_delegation_depth,
+            )
+            return
+
         logger.info(f"Executing task {task_id} on agent {agent_id}")
 
         for hook in self._hooks["pre_execute"]:
@@ -66,11 +98,62 @@ class OrchestrationEngine:
                 await hook(task, result)
 
             logger.info(f"Task {task_id} completed successfully")
+            self.scheduler.complete(task_id)
 
         except Exception as e:
             logger.error(f"Task {task_id} failed: {e}")
             for hook in self._hooks["on_error"]:
                 await hook(task, e)
+
+    def _delegation_depth(self, task: Dict[str, Any]) -> int:
+        direct_depth = task.get("delegation_depth")
+        metadata_depth = task.get("metadata", {}).get("delegation_depth")
+        delegation_depth = task.get("delegation", {}).get("depth")
+        chain = task.get("delegation_chain")
+
+        for value in (direct_depth, metadata_depth, delegation_depth):
+            if value is not None:
+                return self._coerce_depth(value)
+        if isinstance(chain, list):
+            return len(chain)
+        return 0
+
+    def _coerce_depth(self, value: Any) -> int:
+        if isinstance(value, bool):
+            return self.max_delegation_depth + 1
+        try:
+            depth = int(value)
+        except (TypeError, ValueError):
+            return self.max_delegation_depth + 1
+        return max(0, depth)
+
+    def _record_terminal_outcome(
+        self,
+        task: Dict[str, Any],
+        reason: str,
+        delegation_depth: int,
+    ) -> Dict[str, Any]:
+        task_id = task["id"]
+        if task_id in self._terminal_outcomes:
+            return self._terminal_outcomes[task_id]
+
+        outcome = {
+            "task_id": task_id,
+            "status": "failed",
+            "reason": reason,
+            "delegation_depth": delegation_depth,
+            "max_delegation_depth": self.max_delegation_depth,
+            "terminal": True,
+            "recorded_at": time.time(),
+        }
+        self._terminal_outcomes[task_id] = outcome
+        task["terminal_outcome"] = outcome
+        task["status"] = "failed"
+        self.scheduler.complete(task_id)
+        return outcome
+
+    def get_terminal_outcome(self, task_id: str) -> Optional[Dict[str, Any]]:
+        return self._terminal_outcomes.get(task_id)
 
     async def _run_agent_task(self, agent: Dict, task: Dict) -> Any:
         loop = asyncio.get_event_loop()
@@ -82,7 +165,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 
