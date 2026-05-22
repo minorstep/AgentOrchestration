@@ -136,11 +136,13 @@ class TaskScheduler:
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
         if task:
-            task["retries"] += 1
+            previous_retries = task["retries"]
+            task["retries"] = previous_retries + 1
             if task["retries"] < self._max_retries:
                 try:
                     self.enqueue(task, queue, priority=task.get("priority", 0))
                 except Exception:
+                    task["retries"] = previous_retries
                     self._in_flight[task_id] = task
                     self._record_capacity_decision(
                         queue,

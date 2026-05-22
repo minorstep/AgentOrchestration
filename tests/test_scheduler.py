@@ -99,7 +99,7 @@ class TestTaskScheduler:
             scheduler.fail(task["id"])
 
         assert task["id"] in scheduler._in_flight
-        assert scheduler._in_flight[task["id"]]["retries"] == 1
+        assert scheduler._in_flight[task["id"]]["retries"] == 0
         assert scheduler.queue_capacity_state()["used"] == 0
         audit = scheduler.capacity_audit_records()
         assert audit[-1]["decision"] == "retry_enqueue_rollback"
