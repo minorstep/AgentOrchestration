@@ -1,0 +1,30 @@
+version: "3.9"
+
+x-sidecar-defaults: &sidecar-defaults
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m
+    - /var/run/ao:rw,nosuid,nodev,size=16m
+  security_opt:
+    - no-new-privileges:true
+  labels:
+    ao.sidecar: "true"
+
+services:
+  agent-worker:
+    image: agent-orchestrator:latest
+    command: ["ao", "worker"]
+
+  observability-sidecar:
+    <<: *sidecar-defaults
+    image: agent-orchestrator:latest
+    command: ["ao", "metrics", "export"]
+    depends_on:
+      - agent-worker
+
+  helper-sidecar:
+    <<: *sidecar-defaults
+    image: agent-orchestrator:latest
+    command: ["ao", "sidecar", "helper"]
+    depends_on:
+      - agent-worker
