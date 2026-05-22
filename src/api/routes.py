@@ -1,22 +1,115 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+import re
+from typing import Any, Dict, Mapping, Optional, Union
+
+from fastapi import APIRouter, Header, HTTPException
+from pydantic import BaseModel
 
 from src.agent import AgentRegistry, AgentStatus
 
 router = APIRouter()
 registry = AgentRegistry()
 
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+
+class RunDetailResponse(BaseModel):
+    id: str
+    status: str
+    tenant_id: str
+    created_at: float
+    updated_at: float
+    result: Optional[Dict[str, Any]] = None
+
+
+class AdminRunDetailResponse(RunDetailResponse):
+    admin: Dict[str, Any]
+
+
+class RunDetailStore:
+    def __init__(self):
+        self._runs: Dict[str, Dict[str, Any]] = {}
+
+    def get(self, run_id: str) -> Optional[Dict[str, Any]]:
+        return self._runs.get(run_id)
+
+    def add(self, run: Dict[str, Any]) -> None:
+        self._runs[run["id"]] = dict(run)
+
+
+class RunDetailService:
+    public_fields = {
+        "id",
+        "status",
+        "tenant_id",
+        "created_at",
+        "updated_at",
+        "result",
+    }
+    admin_fields = {
+        "worker_id",
+        "internal_state",
+        "debug_context",
+        "scheduler_lock",
+    }
+
+    def __init__(self, store: RunDetailStore):
+        self.store = store
+
+    def get_detail(
+        self,
+        run_id: str,
+        *,
+        include_admin_fields: bool = False,
+        is_admin: bool = False,
+    ) -> Dict[str, Any]:
+        if not isinstance(run_id, str) or not RUN_ID_PATTERN.fullmatch(run_id):
+            raise HTTPException(status_code=422, detail="Malformed run id")
+
+        if include_admin_fields and not is_admin:
+            raise HTTPException(
+                status_code=403,
+                detail="Admin privileges required",
+            )
+
+        run = self.store.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+        detail = {key: run.get(key) for key in self.public_fields}
+        if include_admin_fields:
+            detail["admin"] = {
+                key: run[key]
+                for key in self.admin_fields
+                if key in run
+            }
+        return detail
+
+
+run_detail_service = RunDetailService(RunDetailStore())
+
+
+def _is_admin_request(headers: Mapping[str, str]) -> bool:
+    value = headers.get("x-admin", "")
+    return value.strip().lower() in {"1", "true", "yes"}
+
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +146,23 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.get(
+    "/runs/{run_id}",
+    response_model=Union[AdminRunDetailResponse, RunDetailResponse],
+    response_model_exclude_none=True,
+)
+async def get_run_detail(
+    run_id: str,
+    include_admin_fields: bool = False,
+    x_admin: str = Header(default=""),
+):
+    return run_detail_service.get_detail(
+        run_id,
+        include_admin_fields=include_admin_fields,
+        is_admin=_is_admin_request({"x-admin": x_admin}),
+    )
 
 # 2019-03-18T11:10:18 update
 
