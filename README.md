@@ -55,6 +55,16 @@ Full documentation at [docs.agent-orchestrator.io](https://docs.agent-orchestrat
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
 
+## Docker Build Context
+
+Docker builds are guarded by `scripts/check_docker_context.py`. The audit
+reports the included context size, lists the largest included entries, blocks
+generated directories that should stay out of the image context, and fails if
+the context exceeds the default 5 MiB budget.
+
+Override the budget with `AGENT_ORCHESTRATION_DOCKER_CONTEXT_MAX_BYTES`, for
+example `AGENT_ORCHESTRATION_DOCKER_CONTEXT_MAX_BYTES=10MiB`.
+
 ## Security
 
 Report vulnerabilities via our [bug bounty program](SECURITY.md).
